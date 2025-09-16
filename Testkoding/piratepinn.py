@@ -34,10 +34,10 @@ X0_CONST, L_CONST, T_MIN_CONST, T_MAX_CONST = 0.0, 10.0, 0.0, 10.0
 LOG_RUN_NAME = None  # e.g., "pinn_exp1"; None uses timestamped default
 
 #Architechture parameters
-num_blocks = 3 #Depth of network
-hidden_size = 128  # number of hidden units
-num_fourier_features = 32 #Embedding space
-fourier_sigma = 6.0
+num_blocks = 1 #Depth of network
+hidden_size = 256  # number of hidden units
+num_fourier_features = 64 #Embedding space
+fourier_sigma = 5.0
 # Sine embedding for PirateNet's U-branch
 USE_SINE_EMBED = False
 W0_EMBED = 5.0
@@ -51,15 +51,15 @@ factorize_output=False
 
 #Optimization parameters
 total_steps = int(1e5)
-grad_clip_max_norm = 200  # gradient clipping threshold (L2 norm)
+grad_clip_max_norm = 1e9  # gradient clipping threshold (L2 norm)
 causal_weight = 1.0
 lambda_freq = 1000
 grad_norm_alpha = 0.9
 
 #Learning rate parameters
-base_lr = 3e-4
+base_lr = 1e-3
 decay_rate = 0.9
-decay_steps = 3000
+decay_steps = 1000
 warmup_steps = 3000
 
 #Logging parameters
