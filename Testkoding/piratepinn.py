@@ -34,10 +34,12 @@ X0_CONST, L_CONST, T_MIN_CONST, T_MAX_CONST = 0.0, 10.0, 0.0, 10.0
 LOG_RUN_NAME = None  # e.g., "pinn_exp1"; None uses timestamped default
 
 #Architechture parameters
-num_blocks = 1 #Depth of network
-hidden_size = 256  # number of hidden units
-num_fourier_features = 64 #Embedding space
-fourier_sigma = 5.0
+num_blocks = 2 #Depth of network
+hidden_size = 128  # number of hidden units
+num_fourier_features_x = 48  # x features
+num_fourier_features_t = 24  # t features
+fourier_sigma_x = 6.0
+fourier_sigma_t = 3.0
 # Sine embedding for PirateNet's U-branch
 USE_SINE_EMBED = False
 W0_EMBED = 5.0
@@ -51,13 +53,13 @@ factorize_output=False
 
 #Optimization parameters
 total_steps = int(1e5)
-grad_clip_max_norm = 1e9  # gradient clipping threshold (L2 norm)
+grad_clip_max_norm = 1000  # gradient clipping threshold (L2 norm)
 causal_weight = 1.0
 lambda_freq = 1000
 grad_norm_alpha = 0.9
 
 #Learning rate parameters
-base_lr = 1e-3
+base_lr = 1e-4
 decay_rate = 0.9
 decay_steps = 1000
 warmup_steps = 3000
@@ -71,8 +73,9 @@ def main():
     data = np.load('data_generation/data/data_kdv.npz')
     g_u = data['g_u']
     u_init = data['u'] #[x0->xn]
-    xt = data['xt'] #[number of points][x, t]
-
+    xt = data['xt'] #[number of points][x, t] [[x0->xn, t0], [x0->xn, t1]]
+    print(xt)
+    print(u_init)
     # Physics-driven normalization for inputs: x in [-1,1], t in [0,1]; keep u unscaled
     L_range = float(L_CONST - X0_CONST)
     T_range = float(T_MAX_CONST - T_MIN_CONST)
@@ -92,14 +95,15 @@ def main():
     model = PirateNet(input_size=input_size,
                       output_size=output_size,
                       depth=num_blocks,
-                      fourier_features=num_fourier_features,
-                      sigma=fourier_sigma,
+                      x_features=num_fourier_features_x,
+                      t_features=num_fourier_features_t,
+                      sigma_x=fourier_sigma_x,
+                      sigma_t=fourier_sigma_t,
                       dtype=dtype,
                       use_sine_embed=USE_SINE_EMBED,
                       w0_embed=W0_EMBED).to(device=device, dtype=dtype)
 
     # Prepare u_mean (we keep u in physical units here) and chain-rule scales
-    u_mean = torch.tensor(0.0, dtype=dtype, device=device)
     x_scale = torch.tensor(L_range/2.0, dtype=dtype, device=device)
     t_scale = torch.tensor(T_range,      dtype=dtype, device=device)
     u_scale = torch.tensor(1.0,          dtype=dtype, device=device)
@@ -111,8 +115,17 @@ def main():
         LOG_RUN_NAME if LOG_RUN_NAME else f"pinn_kdv_{_time.strftime('%Y%m%d-%H%M%S')}"
     )
     writer = SummaryWriter(log_dir=run_dir)
+
+
+
     # Initialize the last layer to map features to IC across all times
-    pirate_init(model, x_points, t_points, x0, L, t_min, u0, t_max)
+    stats = physics_init(model, X_val, u0, add_bias=True, return_diagnostics=True)
+
+    print('PirateNet Physics Initialization:')
+    print("RMSE:", stats["rmse"].cpu().numpy())
+    print("rel L2:", stats["rel_l2"].cpu().numpy())
+    print("max |err|:", stats["max_abs"].cpu().numpy())
+    print("||theta||_2:", stats["theta_l2"].cpu().numpy(), "cond(Phi):", stats["cond_Phi"])
 
     # Stepper-based training like pinn.py
     optimizer = optim.Adam(model.parameters(), lr=base_lr)

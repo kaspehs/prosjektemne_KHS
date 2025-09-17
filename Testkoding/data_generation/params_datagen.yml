@@ -5,7 +5,7 @@ folder: ./data_generation/data
 filename: data_kdv
 
 # Grid Parameters
-x_max: 20                                  # The length (width/period) in the spatial domain
+x_max: 10                                  # The length (width/period) in the spatial domain
 x_points: 100                              # Number of points in the spatial domain
 t_max: 10                                  # Total seconds in g_u
 t_points: 400                              # Number of points in g_u
