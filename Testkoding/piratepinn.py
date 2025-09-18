@@ -34,26 +34,28 @@ X0_CONST, L_CONST, T_MIN_CONST, T_MAX_CONST = 0.0, 10.0, 0.0, 10.0
 LOG_RUN_NAME = None  # e.g., "pinn_exp1"; None uses timestamped default
 
 #Architechture parameters
-num_blocks = 2 #Depth of network
+num_blocks = 1 #Depth of network
 hidden_size = 128  # number of hidden units
-num_fourier_features_x = 48  # x features
-num_fourier_features_t = 24  # t features
-fourier_sigma_x = 6.0
-fourier_sigma_t = 3.0
+fourier_features = 128
+sigma = 1.0
+num_fourier_features_x = None  # x features
+num_fourier_features_t = None  # t features
+fourier_sigma_x = 8.0
+fourier_sigma_t = 2.0
 # Sine embedding for PirateNet's U-branch
 USE_SINE_EMBED = False
 W0_EMBED = 5.0
-n_r = 128 #Batchsize is n_r*num_chunks
+n_r = 64 #Batchsize is n_r*num_chunks
 num_chunks = 16 #Time chunks for causal training
-n_bc = 128 #Number of colocation points for enforcing BCs
-n_ic = 128 #Number of colocation points for enforcing BCs
+n_bc = 64 #Number of colocation points for enforcing BCs
+n_ic = 64 #Number of colocation points for enforcing BCs
 use_rwf=True
 rwf_mu = 1.0; rwf_sigma = 0.1
 factorize_output=False
 
 #Optimization parameters
 total_steps = int(1e5)
-grad_clip_max_norm = 1000  # gradient clipping threshold (L2 norm)
+grad_clip_max_norm = 1e5  # gradient clipping threshold (L2 norm)
 causal_weight = 1.0
 lambda_freq = 1000
 grad_norm_alpha = 0.9
@@ -61,7 +63,7 @@ grad_norm_alpha = 0.9
 #Learning rate parameters
 base_lr = 1e-4
 decay_rate = 0.9
-decay_steps = 1000
+decay_steps = 2000
 warmup_steps = 3000
 
 #Logging parameters
@@ -95,6 +97,8 @@ def main():
     model = PirateNet(input_size=input_size,
                       output_size=output_size,
                       depth=num_blocks,
+                      fourier_features=fourier_features,
+                      sigma = sigma,  
                       x_features=num_fourier_features_x,
                       t_features=num_fourier_features_t,
                       sigma_x=fourier_sigma_x,

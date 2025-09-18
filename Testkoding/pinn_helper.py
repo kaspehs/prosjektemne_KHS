@@ -270,6 +270,28 @@ class TrainingStepper:
         if grad_norm_mean is not None:
             self.writer.add_scalar('grad/total_norm_mean', grad_norm_mean, self.steps)
 
+        # Log current lambda weights for losses (res, bc, ic)
+        try:
+            for k, v in self.lam.items():
+                lam_f = float(v.detach().cpu()) if torch.is_tensor(v) else float(v)
+                self.writer.add_scalar(f'lambda/{k}', lam_f, self.steps)
+        except Exception:
+            pass
+
+        # Log per-block alpha parameters if present (e.g., PirateNet residual blocks)
+        try:
+            blks = getattr(self.model, 'blocks', None)
+            if blks is not None:
+                for i, b in enumerate(blks, start=1):
+                    a = getattr(b, 'alpha', None)
+                    if a is not None:
+                        try:
+                            self.writer.add_scalar(f'blocks/alpha_{i}', float(a.detach().cpu()), self.steps)
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
         print(
         f"Epoch {self.steps+1:02d} "
         f"train(total={train.get('total', float('nan')):.3e}, res={train.get('res', float('nan')):.3e}, bc={train.get('bc', float('nan')):.3e}), ic={train.get('ic', float('nan')):.3e} "
@@ -310,7 +332,7 @@ class TrainingStepper:
             self.lam = self.balancer.update({'ic':ic_loss, 'bc': bc_loss, 'res': residual_loss})
 
         #Backpropagation
-        self.optimizer.zero_grad()
+        self.optimizer.zero_grad(set_to_none=True)
         loss.backward()
         total_grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_max_norm)
         self.optimizer.step()
@@ -369,44 +391,60 @@ class GradNormBalancer:
     Maintains global weights for multiple loss terms based on gradient norms.
     Updates every `freq` steps using EMA with coefficient `alpha`.
     """
-    def __init__(self, model: nn.Module, names=("ic","bc","res"), alpha=0.9, eps=1e-12, device=None):
-        self.model = model
-        self.names = names
-        self.alpha = alpha
-        self.eps = eps
+    def __init__(self, model: nn.Module, names=("ic","bc","res"), alpha=0.9, eps=1e-8, device=None):
+        self.model  = model
+        self.names  = tuple(names)
+        self.alpha  = alpha
+        self.eps    = eps
+        self.w_min  = 0.1
+        self.w_max  = 10
         self.device = device or next(model.parameters()).device
-        # start with ones
-        self.lam = {n: torch.tensor(1.0, device=self.device) for n in names}
 
-    @torch.no_grad()
-    def _ema_update(self, lam_hat):
-        for n in self.names:
-            self.lam[n] = self.alpha * self.lam[n] + (1 - self.alpha) * lam_hat[n]
-
-    def _grad_norm(self, loss):
-        """L2 norm of d(loss)/d(theta) over all trainable parameters."""
+        # EMA of grad norms; init to 1 for neutrality
+        self.g_ema  = {n: torch.tensor(1.0, device=self.device) for n in self.names}
+        # Public weights (mean ~ 1 at start)
+        self.w      = {n: torch.tensor(1.0, device=self.device) for n in self.names}
+        self.step   = 0
+    
+    def _global_grad_norm(self, loss):
         params = [p for p in self.model.parameters() if p.requires_grad]
-        grads = autograd.grad(loss, params, retain_graph=True, create_graph=False, allow_unused=True)
-        sq = 0.0
+        grads  = torch.autograd.grad(loss, params, retain_graph=True,
+                                     create_graph=False, allow_unused=True)
+        sq = None
         for g in grads:
             if g is not None:
-                sq = sq + g.pow(2).sum()
+                # ignore non-finite entries (rare but safer)
+                g = g.detach()
+                if not torch.isfinite(g).all():
+                    g = torch.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0)
+                v = (g*g).sum()
+                sq = v if sq is None else (sq + v)
+        if sq is None:
+            return torch.tensor(0.0, device=self.device)
         return torch.sqrt(sq + self.eps)
 
+    @torch.no_grad()
     def update(self, losses: dict):
-        """
-        losses: dict with keys matching `names`, values are scalar tensors.
-        Returns current lambda (possibly updated this step) as a dict.
-        """
-        # compute gradient norms
-        norms = {n: self._grad_norm(losses[n]) for n in self.names}
-        total = sum(norms.values())
+        # 1) measure pre-clip grad norms for each term
+        g = {n: self._global_grad_norm(losses[n]) for n in self.names}
 
-        lam_hat = {n: (total / (norms[n] + self.eps)).detach() for n in self.names}
+        # 2) EMA on norms
+        for n in self.names:
+            self.g_ema[n] = self.alpha*self.g_ema[n] + (1 - self.alpha)*torch.clamp(g[n], min=self.eps)
 
-        self._ema_update(lam_hat)   # λ ← α λ + (1-α) λ̂
+        # 3) inverse-proportional proposal
+        inv = {n: 1.0 / torch.clamp(self.g_ema[n], min=self.eps) for n in self.names}
 
-        return {n: self.lam[n].detach() for n in self.names}
+        # 4) normalize so mean weight = 1
+        s = sum(inv.values())
+        k = float(len(self.names))
+        w_hat = {n: (inv[n] * (k / s)) for n in self.names}
+
+        # 5) clamp to [w_min, w_max]
+        for n in self.names:
+            self.w[n] = torch.clamp(w_hat[n], self.w_min, self.w_max)
+        
+        return {n: self.w[n].detach() for n in self.names}
 
 def physics_init(model, X, u0, ridge=1e-6, add_bias=True, return_diagnostics=False):
     device = next(model.parameters()).device
