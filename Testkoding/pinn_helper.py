@@ -29,329 +29,6 @@ def d_x(u, x):   return d(u, x)
 def d_xx(u, x):  return d(d_x(u, x), x)
 def d_xxx(u, x): return d(d_xx(u, x), x)
 
-def pinn_kdv_loss(model,
-                  # data points (used for supervised loss)
-                  xb,
-                  # BC points at x=0 and x=L for periodicity
-                  t_bc, L, x0,
-                  # IC ground truth, IC collocatino points at t=O
-                  u0, x_ic, t0,
-                  # scales for inputs and outputs for the PDE
-                  x_scale, t_scale, u_scale,
-                  # mean of u in original (unscaled) units for standardized outputs
-                  u_mean,
-                  # supervised targets at xb
-                  yb,
-                  # weights for each term
-                  w_pde=1.0, w_bc=1.0, w_data=1.0, w_ic = 1.0,
-                  #Number of time domain chunks
-                  n_chunks: int = 16,
-                  # optional separate collocation points for PDE residual
-                  xb_r=None,
-                  # optional conditioning features (e.g., IC vector), shape (F,) or (N,F)
-                  normalize_terms: bool = True,
-                  #If validation, compute all loss terms
-                  validation: bool = False,
-                ):
-    """
-    Returns total_loss, dict_of_terms. All inputs are 1D tensors of same length per group.
-    L is domain length in x for periodic BCs.
-    """
-    # If physics weights are zero, short-circuit to pure data loss
-    if w_pde == 0.0 and w_bc == 0.0 and not validation:
-        # Pure data path: ensure shapes match to avoid broadcasting
-        pred = model(xb).squeeze(-1)
-        target = yb.squeeze(-1)
-        loss_data = torch.mean((pred - target)**2)
-        total = w_data * loss_data
-        return total, {
-            "pde": 0.0,
-            "bc":  0.0,
-            "data": loss_data.item(),
-            "total": total.item(),
-            #"ut": 0.0,
-            #"nl": 0.0,
-            #"uxxx": 0.0,
-        }
-    
-    # Choose collocation set for PDE residual
-    colloc = xb_r if xb_r is not None else xb
-    colloc = colloc.clone().detach().requires_grad_(True)
-
-    #Requires gradient to be created for BC and IC points
-    t_bc = t_bc.clone().detach().requires_grad_(True)
-    x_ic = x_ic.clone().detach().requires_grad_(True)
-
-    # ---- PDE residual on collocation points ----
-    # model expects concat [x, t] -> u(t,x)
-    pred_r = model(colloc).squeeze(-1)
-    u_r = pred_r
-
-    # First derivatives wrt both inputs in one call
-    grads = d(pred_r, colloc)                 # shape (N, 2)
-    ux, ut = grads[:, 0], grads[:, 1]
-
-    # Higher-order x-derivatives via repeated grad wrt xb, select x column
-    grads2 = d(ux, colloc)
-    uxx = grads2[:, 0]
-    grads3 = d(uxx, colloc)
-    uxxx = grads3[:, 0]
-
-    # Per-term residual normalization for optimization, but also compute raw residual for logging
-    eps = torch.as_tensor(1e-12, dtype=u_r.dtype, device=u_r.device)
-    c2s = (6.0 * u_scale * t_scale / x_scale)  # scales u' * u'_x term
-    c2mu = (6.0 * u_mean * t_scale / x_scale)  # mean term mu * u'_x
-    c3 = (t_scale / (x_scale**3))
-
-    t1 = ut
-    t2_base = (u_r * ux)
-    t2_mu_base = ux
-    t3 = uxxx
-
-    # Raw (unweighted) residual for monitoring
-    res_raw = t1 + c2s * t2_base + c2mu * t2_mu_base + c3 * t3
-    pde_raw = torch.mean(res_raw.pow(2))
-
-    if normalize_terms:
-        # Normalized residual used for the optimization
-        s1 = torch.sqrt((t1.pow(2)).mean() + eps)
-        s2 = torch.sqrt((t2_base.pow(2)).mean() + eps)
-        s2mu = torch.sqrt((t2_mu_base.pow(2)).mean() + eps)
-        s3 = torch.sqrt((t3.pow(2)).mean() + eps)
-
-        res = (t1 / s1) + (c2s * (t2_base / s2)) + (c2mu * (t2_mu_base / s2mu)) + (c3 * (t3 / s3))
-        loss_pde = torch.mean(res**2)
-    else:
-        # Use raw residual directly
-        loss_pde = torch.mean(res_raw**2)
-
-    # ---- Periodic boundary conditions at x=0 and x=L ----
-    # u(t,0) == u(t,L), ux(t,0) == ux(t,L), uxx(t,0) == uxx(t,L) (smooth periodicity)
-    x0_val = float(x0.item())
-    L_val  = float(L.item())
-    x0v = torch.full_like(t_bc, fill_value=x0_val)
-    xLv = torch.full_like(t_bc, fill_value=L_val)
-
-    xb0 = torch.stack([x0v, t_bc], dim=1).clone().detach().requires_grad_(True)
-    xbL = torch.stack([xLv, t_bc], dim=1).clone().detach().requires_grad_(True)
-
-    u_0 = model(xb0).squeeze(-1)
-    u_L = model(xbL).squeeze(-1)
-
-    g0 = d(u_0, xb0)
-    gL = d(u_L, xbL)
-    ux_0 = g0[:, 0]
-    ux_L = gL[:, 0]
-    g0_2 = d(ux_0, xb0)
-    gL_2 = d(ux_L, xbL)
-    uxx_0 = g0_2[:, 0]
-    uxx_L = gL_2[:, 0]
-
-    loss_bc = torch.mean((u_0 - u_L)**2) + \
-              torch.mean((ux_0 - ux_L)**2) + \
-              torch.mean((uxx_0 - uxx_L)**2)
-    
-    # ---- Initial condition at t=t0 with interpolation from u0(x) ----
-    # Build evaluation inputs at IC time
-    t0_val = float(t0.item())
-    t0v = torch.full_like(x_ic, fill_value=t0_val)
-    xbIC = torch.stack([x_ic, t0v], dim=1).clone().detach().requires_grad_(True)
-
-    # Interpolate ground-truth u0 at x_ic along standardized x-grid [x0, L]
-    x_grid = torch.linspace(x0, L, steps=u0.numel(), device=xbIC.device, dtype=xbIC.dtype)
-    def _interp1d_sorted(xg, yg, xq, eps: float = 1e-12):
-        idx = torch.searchsorted(xg, xq, right=False)
-        idx = idx.clamp(min=1, max=xg.numel()-1)
-        x0i = xg[idx-1]; x1i = xg[idx]
-        y0i = yg[idx-1]; y1i = yg[idx]
-        w = (xq - x0i) / (x1i - x0i + eps)
-        return y0i + w * (y1i - y0i)
-    u0_interp = _interp1d_sorted(x_grid, u0.view(-1), x_ic)
-
-    uIC = model(xbIC).squeeze(-1)
-    loss_ic = torch.mean((uIC - u0_interp)**2)
-    
-    # Supervised data term (match shapes to avoid broadcasting)
-    pred_d = model(xb).squeeze(-1)
-    target = yb.squeeze(-1)
-    loss_data = torch.mean((pred_d - target)**2)
-
-    total = w_pde*loss_pde + w_bc*loss_bc + w_ic*loss_ic + w_data*loss_data
-    return total, {
-    # Log the unweighted PDE residual (raw), keep weighted for optimization
-    "pde": pde_raw.item(),
-    "pde_w": loss_pde.item(),
-    "bc":  (loss_bc.item() + loss_ic.item()),
-    "pure_bc":  loss_bc.item(),
-    "ic":  loss_ic.item(),
-    "data": loss_data.item(),
-    "total": total.item(),
-    #"ut": s1.item(),
-    #"nl": s2.item(),
-    #"uxxx": s3.item(),
-}
-def pinn_kdv_loss(model,
-                  # data points (used for supervised loss)
-                  xb,
-                  # BC points at x=0 and x=L for periodicity
-                  t_bc, L, x0,
-                  # IC ground truth, IC collocatino points at t=O
-                  u0, x_ic, t0,
-                  # scales for inputs and outputs for the PDE
-                  x_scale, t_scale, u_scale,
-                  # mean of u in original (unscaled) units for standardized outputs
-                  u_mean,
-                  # supervised targets at xb
-                  yb,
-                  # weights for each term
-                  w_pde=1.0, w_bc=1.0, w_data=1.0, w_ic = 1.0,
-                  #Number of time domain chunks
-                  n_chunks: int = 16,
-                  # optional separate collocation points for PDE residual
-                  xb_r=None,
-                  # optional conditioning features (e.g., IC vector), shape (F,) or (N,F)
-                  normalize_terms: bool = True,
-                  #If validation, compute all loss terms
-                  validation: bool = False,
-                ):
-    """
-    Returns total_loss, dict_of_terms. All inputs are 1D tensors of same length per group.
-    L is domain length in x for periodic BCs.
-    """
-    # If physics weights are zero, short-circuit to pure data loss
-    if w_pde == 0.0 and w_bc == 0.0 and not validation:
-        # Pure data path: ensure shapes match to avoid broadcasting
-        pred = model(xb).squeeze(-1)
-        target = yb.squeeze(-1)
-        loss_data = torch.mean((pred - target)**2)
-        total = w_data * loss_data
-        return total, {
-            "pde": 0.0,
-            "bc":  0.0,
-            "data": loss_data.item(),
-            "total": total.item(),
-            #"ut": 0.0,
-            #"nl": 0.0,
-            #"uxxx": 0.0,
-        }
-    
-    # Choose collocation set for PDE residual
-    colloc = xb_r if xb_r is not None else xb
-    colloc = colloc.clone().detach().requires_grad_(True)
-
-    #Requires gradient to be created for BC and IC points
-    t_bc = t_bc.clone().detach().requires_grad_(True)
-    x_ic = x_ic.clone().detach().requires_grad_(True)
-
-    # ---- PDE residual on collocation points ----
-    # model expects concat [x, t] -> u(t,x)
-    pred_r = model(colloc).squeeze(-1)
-    u_r = pred_r
-
-    # First derivatives wrt both inputs in one call
-    grads = d(pred_r, colloc)                 # shape (N, 2)
-    ux, ut = grads[:, 0], grads[:, 1]
-
-    # Higher-order x-derivatives via repeated grad wrt xb, select x column
-    grads2 = d(ux, colloc)
-    uxx = grads2[:, 0]
-    grads3 = d(uxx, colloc)
-    uxxx = grads3[:, 0]
-
-    # Per-term residual normalization for optimization, but also compute raw residual for logging
-    eps = torch.as_tensor(1e-12, dtype=u_r.dtype, device=u_r.device)
-    c2s = (6.0 * u_scale * t_scale / x_scale)  # scales u' * u'_x term
-    c2mu = (6.0 * u_mean * t_scale / x_scale)  # mean term mu * u'_x
-    c3 = (t_scale / (x_scale**3))
-
-    t1 = ut
-    t2_base = (u_r * ux)
-    t2_mu_base = ux
-    t3 = uxxx
-
-    # Raw (unweighted) residual for monitoring
-    res_raw = t1 + c2s * t2_base + c2mu * t2_mu_base + c3 * t3
-    pde_raw = torch.mean(res_raw.pow(2))
-
-    if normalize_terms:
-        # Normalized residual used for the optimization
-        s1 = torch.sqrt((t1.pow(2)).mean() + eps)
-        s2 = torch.sqrt((t2_base.pow(2)).mean() + eps)
-        s2mu = torch.sqrt((t2_mu_base.pow(2)).mean() + eps)
-        s3 = torch.sqrt((t3.pow(2)).mean() + eps)
-
-        res = (t1 / s1) + (c2s * (t2_base / s2)) + (c2mu * (t2_mu_base / s2mu)) + (c3 * (t3 / s3))
-        loss_pde = torch.mean(res**2)
-    else:
-        # Use raw residual directly
-        loss_pde = torch.mean(res_raw**2)
-
-    # ---- Periodic boundary conditions at x=0 and x=L ----
-    # u(t,0) == u(t,L), ux(t,0) == ux(t,L), uxx(t,0) == uxx(t,L) (smooth periodicity)
-    x0_val = float(x0.item())
-    L_val  = float(L.item())
-    x0v = torch.full_like(t_bc, fill_value=x0_val)
-    xLv = torch.full_like(t_bc, fill_value=L_val)
-
-    xb0 = torch.stack([x0v, t_bc], dim=1).clone().detach().requires_grad_(True)
-    xbL = torch.stack([xLv, t_bc], dim=1).clone().detach().requires_grad_(True)
-
-    u_0 = model(xb0).squeeze(-1)
-    u_L = model(xbL).squeeze(-1)
-
-    g0 = d(u_0, xb0)
-    gL = d(u_L, xbL)
-    ux_0 = g0[:, 0]
-    ux_L = gL[:, 0]
-    g0_2 = d(ux_0, xb0)
-    gL_2 = d(ux_L, xbL)
-    uxx_0 = g0_2[:, 0]
-    uxx_L = gL_2[:, 0]
-
-    loss_bc = torch.mean((u_0 - u_L)**2) + \
-              torch.mean((ux_0 - ux_L)**2) + \
-              torch.mean((uxx_0 - uxx_L)**2)
-    
-    # ---- Initial condition at t=t0 with interpolation from u0(x) ----
-    # Build evaluation inputs at IC time
-    t0_val = float(t0.item())
-    t0v = torch.full_like(x_ic, fill_value=t0_val)
-    xbIC = torch.stack([x_ic, t0v], dim=1).clone().detach().requires_grad_(True)
-
-    # Interpolate ground-truth u0 at x_ic along standardized x-grid [x0, L]
-    x_grid = torch.linspace(x0, L, steps=u0.numel(), device=xbIC.device, dtype=xbIC.dtype)
-    def _interp1d_sorted(xg, yg, xq, eps: float = 1e-12):
-        idx = torch.searchsorted(xg, xq, right=False)
-        idx = idx.clamp(min=1, max=xg.numel()-1)
-        x0i = xg[idx-1]; x1i = xg[idx]
-        y0i = yg[idx-1]; y1i = yg[idx]
-        w = (xq - x0i) / (x1i - x0i + eps)
-        return y0i + w * (y1i - y0i)
-    u0_interp = _interp1d_sorted(x_grid, u0.view(-1), x_ic)
-
-    uIC = model(xbIC).squeeze(-1)
-    loss_ic = torch.mean((uIC - u0_interp)**2)
-    
-    # Supervised data term (match shapes to avoid broadcasting)
-    pred_d = model(xb).squeeze(-1)
-    target = yb.squeeze(-1)
-    loss_data = torch.mean((pred_d - target)**2)
-
-    total = w_pde*loss_pde + w_bc*loss_bc + w_ic*loss_ic + w_data*loss_data
-    return total, {
-    # Log the unweighted PDE residual (raw), keep weighted for optimization
-    "pde": pde_raw.item(),
-    "pde_w": loss_pde.item(),
-    "bc":  (loss_bc.item() + loss_ic.item()),
-    "pure_bc":  loss_bc.item(),
-    "ic":  loss_ic.item(),
-    "data": loss_data.item(),
-    "total": total.item(),
-    #"ut": s1.item(),
-    #"nl": s2.item(),
-    #"uxxx": s3.item(),
-    }
-
 def residual_kdv_loss(model,
                   #Maximum time needed for causal training and chunking, assumed t0 = 0
                   t_max,
@@ -512,53 +189,6 @@ def mse_data_loss(model, xb, yb):
         "data": data_loss.item(),
     }
 
-def get_min_max(X_train, device, dtype=torch.float32):
-    t_min = min(X_train[:, 1])
-    t_max = max(X_train[:, 1])
-    x0 = min(X_train[:, 0])
-    L = max(X_train[:, 0])
-
-    t_min = torch.tensor(t_min, dtype=dtype, device=device)
-    t_max = torch.tensor(t_max, dtype=dtype, device=device)
-    x0    = torch.tensor(x0,    dtype=dtype, device=device)
-    L     = torch.tensor(L,     dtype=dtype, device=device)
-
-    return t_min, t_max, x0, L
-
-def old_weight_schedule(epoch,
-                    warmup_epochs: int,
-                    ramp_epochs: int,
-                    w_data_start: float,
-                    w_data_end: float,
-                    w_pde_start: float,
-                    w_pde_end: float,
-                    w_bc_start: float,
-                    w_bc_end: float):
-    """
-    Linear ramp schedule for loss weights.
-    - Holds start values for `warmup_epochs`, then linearly interpolates over `ramp_epochs`.
-    - Returns (w_data, w_pde, w_bc) for the given epoch.
-    """
-    if epoch < warmup_epochs:
-        return w_data_start, w_pde_start, w_bc_start
-    if epoch < warmup_epochs + ramp_epochs:
-        a = (epoch - warmup_epochs) / float(ramp_epochs)
-        wd = (1 - a) * w_data_start + a * w_data_end
-        wp = (1 - a) * w_pde_start + a * w_pde_end
-        wb = (1 - a) * w_bc_start + a * w_bc_end
-        return wd, wp, wb
-    return w_data_end, w_pde_end, w_bc_end
-
-def lr_schedule(step: int,
-                max_lr: float,
-                decay_rate: float,
-                warmup_steps: int,
-                decay_steps: int):
-    
-    if step <= warmup_steps:
-        return max_lr * step/warmup_steps
-    return max_lr * (decay_rate)**((step-warmup_steps)/decay_steps)
-
 class LrSchedule():
     def __init__(self,max_lr, decay_rate, warmup_steps, decay_steps):
         self.max_lr = max_lr; self.decay_rate = decay_rate; self.warmup_steps = warmup_steps; self.decay_steps = decay_steps
@@ -590,62 +220,6 @@ def sample_collocation(n_r: int,
     t_bc = torch.rand(n_bc, device=device, dtype=t_min.dtype) * (t_max - t_min) + t_min
     x_ic = torch.rand(n_ic, device=device, dtype=x0.dtype) * (L - x0) + x0
     return x_r, t_bc, x_ic
-
-def train_step(model,
-               xb: torch.Tensor,
-               yb: torch.Tensor,
-               x0: torch.Tensor,
-               L: torch.Tensor,
-               t_min: torch.Tensor,
-               t_max: torch.Tensor,
-               x_scale: torch.Tensor,
-               t_scale: torch.Tensor,
-               u_scale: torch.Tensor,
-               u_mean: torch.Tensor,
-               u0: torch.Tensor,
-               w_pde: float,
-               w_bc: float,
-               w_data: float,
-               optimizer: torch.optim.Optimizer,
-               grad_clip_max_norm: float,
-               n_r: int = 256,
-               n_bc: int = 256,
-               n_ic: int = 256,
-               num_chunks: int = 16,
-               causal_weight: float = 1.0):
-    """One training step: sample collocation, compute loss, backprop, clip, step.
-
-    Returns: (loss_value, terms_dict, grad_total_norm)
-    """
-    device = xb.device
-    # Sample interior collocation points and BC times
-    x_r, t_bc, x_ic = sample_collocation(
-        n_r=n_r,
-        n_bc=n_bc,
-        n_ic=n_ic,
-        num_chunks=num_chunks,
-        x0=x0, L=L, t_min=t_min, t_max=t_max,
-        device=device,
-    )
-
-    residual_loss, terms = residual_kdv_loss(model, t_max, x_r, x_scale, t_scale, u_scale, u_mean, num_chunks, causal_weight)
-    bc_loss, terms = periodic_bc_loss(model, t_bc, x0, L)
-    ic_loss, terms = init_condition_loss(model, u0, x_ic, t_min, x0, L)
-    #data_loss, terms = mse_data_loss(model, xb, yb)
-
-
-
-    optimizer.zero_grad()
-    loss.backward()
-    total_grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_max_norm)
-    optimizer.step()
-
-    try:
-        gnorm = float(total_grad_norm)
-    except Exception:
-        gnorm = float('nan')
-
-    return float(loss.item()), terms, gnorm
 
 class TrainingStepper:
     def __init__(self, model, #The NN model
@@ -790,7 +364,6 @@ class TrainingStepper:
         import matplotlib.pyplot as _plt
         _plt.close(fig)
 
-
 class GradNormBalancer:
     """
     Maintains global weights for multiple loss terms based on gradient norms.
@@ -835,99 +408,80 @@ class GradNormBalancer:
 
         return {n: self.lam[n].detach() for n in self.names}
 
-def run_lbfgs_finisher(model: torch.nn.Module,
-                       train_loader,
-                       x0: torch.Tensor,
-                       L: torch.Tensor,
-                       t_min: torch.Tensor,
-                       t_max: torch.Tensor,
-                       x_scale: torch.Tensor,
-                       t_scale: torch.Tensor,
-                       u_scale: torch.Tensor,
-                       u_mean: torch.Tensor,
-                       u0: torch.Tensor,
-                       w_data: float,
-                       w_pde: float,
-                       w_bc: float,
-                       n_r_factor: int = 4,
-                       n_bc: int = 64,
-                       n_ic: int = 64,
-                       lr: float = 1.0,
-                       max_iter: int = 300,
-                       history_size: int = 10,
-                       feat: torch.Tensor | None = None,
-                       use_lhs: bool = False,
-                       normalize_terms: bool = True):
-    """Run an LBFGS pass over the training loader; returns list of batch losses."""
+def physics_init(model, X, u0, ridge=1e-6, add_bias=True, return_diagnostics=False):
     device = next(model.parameters()).device
-    model.train()
-    lbfgs = torch.optim.LBFGS(
-        model.parameters(),
-        lr=lr,
-        max_iter=max_iter,
-        history_size=history_size,
-        line_search_fn='strong_wolfe'
-    )
+    dtype  = next(model.parameters()).dtype
+    X = torch.as_tensor(X, dtype=dtype, device=device)
+    u0 = torch.as_tensor(u0, dtype=dtype, device=device)
+    X = X.to(device=device, dtype=dtype)
 
-    batch_losses = []
-    for xb, yb in train_loader:
-        xb = xb.to(device)
-        yb = yb.to(device)
+    # Build y from u0 by repeating across time-major blocks,
+    # or by 1D interpolation on x if shapes don't divide evenly.
+    if u0 is None:
+        raise ValueError("physics_init: either y or u0 must be provided")
+    u0 = u0.to(device=device, dtype=dtype).view(-1)
+    N = X.size(0)
+    M = u0.numel()
+    if M > 0 and (N % M) == 0:
+        y = u0.repeat(N // M).unsqueeze(1)
+    else:
+        x_samples = X[:, 0]
+        x_grid = torch.linspace(x_samples.min(), x_samples.max(), steps=M, device=device, dtype=dtype)
+        idx = torch.searchsorted(x_grid, x_samples, right=False).clamp_(1, M - 1)
+        xL = x_grid[idx - 1]; xR = x_grid[idx]
+        yL = u0[idx - 1];     yR = u0[idx]
+        w = (x_samples - xL) / (xR - xL + torch.finfo(dtype).eps)
+        y = (yL + w * (yR - yL)).unsqueeze(1)
 
-        xb_r, t_bc, x_ic = sample_collocation(
-        n_r=int(n_r_factor * xb.size(0)),
-        n_bc=n_bc,
-        n_ic=n_ic,
-        x0=x0, L=L, t_min=t_min, t_max=t_max,
-        device=device,
-        use_lhs=use_lhs,
-    )
+    H = model.features(X)  # (N, hidden) — should be linear features at t=0
+    Phi = torch.cat([H, torch.ones(H.size(0), 1, device=device, dtype=dtype)], dim=1) if add_bias else H
 
-        def closure():
-            lbfgs.zero_grad()
-            loss, _ = pinn_kdv_loss(
-                model, xb, t_bc, L, x0, u0, x_ic, t_min, x_scale, t_scale, u_scale, u_mean, yb,
-                w_pde, w_bc, w_data, xb_r=xb_r, feat=feat, normalize_terms=normalize_terms
-            )
+    # Use normal equations with ridge (supported on MPS):
+    A = Phi.T @ Phi
+    if ridge and float(ridge) > 0.0:
+        A = A + ridge * torch.eye(A.size(0), device=device, dtype=dtype)
+    b = Phi.T @ y
+    theta = torch.linalg.solve(A, b)  # (hidden[+1], out)
 
-            loss.backward()
-            return loss
+    # Load into head
+    if add_bias:
+        model.out.weight.data.copy_(theta[:-1, :].mT)
+        model.out.bias.data.copy_(theta[-1, :])
+    else:
+        model.out.weight.data.copy_(theta.mT)
+        torch.nn.init.zeros_(model.out.bias)
 
-        loss_val = lbfgs.step(closure)
-        try:
-            batch_losses.append(float(loss_val.detach().cpu()))
-        except Exception:
-            pass
+    if not return_diagnostics:
+        return theta
 
-    return batch_losses
+    # Diagnostics
+    y_hat = Phi @ theta                      # (N, out)
+    err   = y_hat - y
+    mse   = (err.pow(2).mean(dim=0))         # per-output
+    rmse  = mse.sqrt()
+    rel_l2 = (err.norm(dim=0) / (y.norm(dim=0).clamp_min(1e-12)))
+    max_abs = err.abs().max(dim=0).values
+    # Coeff magnitudes
+    theta_l2 = theta.norm(dim=0)             # per-output
+    theta_linf = theta.abs().max(dim=0).values
+    # Conditioning
+    # Approximate conditioning via eigenvalues of A = Phi^T Phi
+    try:
+        evals = torch.linalg.eigvalsh(A)
+        cond = (evals.max() / evals.min().clamp_min(1e-15)).item()
+    except Exception:
+        cond = float('nan')
 
-def pirate_init(model, x_points, t_points, x0, L, t_min, u0, t_max):
-        
-        # Get device/dtype robustly from model parameters
-        dev = next(model.parameters()).device
-        dtp = next(model.parameters()).dtype
-
-        x_grid = torch.linspace(x0, L, steps=x_points, device=dev, dtype=dtp)
-        t_grid = torch.linspace(t_min, t_max, steps=t_points, device=dev, dtype=dtp)
-        
-        # Cartesian product (x_ic, t_grid)
-        x_rep = x_grid.repeat_interleave(t_points)
-        t_rep = t_grid.repeat(x_grid.numel())
-        xbIC = torch.stack([x_rep, t_rep], dim=1).clone().detach().requires_grad_(True)
-
-        # Interpolate ground-truth u0 at x_ic along standardized x-grid [x0, L]
-        def _interp1d_sorted(xg, yg, xq, eps: float = 1e-12):
-            idx = torch.searchsorted(xg, xq, right=False)
-            idx = idx.clamp(min=1, max=xg.numel()-1)
-            x0i = xg[idx-1]; x1i = xg[idx]
-            y0i = yg[idx-1]; y1i = yg[idx]
-            w = (xq - x0i) / (x1i - x0i + eps)
-            return y0i + w * (y1i - y0i)
-        u0_interp = _interp1d_sorted(x_grid, u0.to(device=dev, dtype=dtp).view(-1), x_grid)
-        # Repeat u0 for each sampled time at the same x
-        y_ic = u0_interp.repeat(t_points)
-
-        model.physics_init(xbIC, y_ic)
+    return {
+        "theta": theta,
+        "rmse": rmse,                        # tensor of size (out,)
+        "rel_l2": rel_l2,                    # tensor of size (out,)
+        "max_abs": max_abs,                  # tensor of size (out,)
+        "theta_l2": theta_l2,
+        "theta_linf": theta_linf,
+        "cond_Phi": cond,
+        "y_hat_sample": y_hat[:10].detach(), # small peek
+    }
 
 def pirate_log_epoch_scalars(writer,
                       epoch: int,

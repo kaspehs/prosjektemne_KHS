@@ -161,17 +161,45 @@ class SirenMLP(torch.nn.Module):
 
 
 class FourierFeatures(torch.nn.Module):
-    """Random Fourier feature mapping for [x,t] inputs: phi(z) = [sin(Bz), cos(Bz)]."""
+    """Legacy joint Random Fourier features: kept for backward compatibility."""
     def __init__(self, in_dim: int, out_features: int, sigma: float = 1.0, dtype=torch.float64):
         super().__init__()
         B = torch.randn(out_features, in_dim, dtype=dtype) * sigma
         self.register_buffer('B', B)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Ensure input matches buffer dtype/device to avoid matmul dtype errors
         x = x.to(device=self.B.device, dtype=self.B.dtype)
         z = x @ self.B.t()
         return torch.cat([torch.sin(z), torch.cos(z)], dim=-1)
+
+
+class FourierFeaturesXT(torch.nn.Module):
+    """
+    Random Fourier features with separate banks for x and t, plus passthrough of x and t.
+    Given input columns [x, t], returns features:
+      [x, t, sin(bx*x), cos(bx*x), sin(bt*t), cos(bt*t)]
+    where bx ~ N(0, sigma_x^2), bt ~ N(0, sigma_t^2).
+    """
+    def __init__(self,
+                 n_x: int,
+                 n_t: int,
+                 sigma_x: float = 1.0,
+                 sigma_t: float = 1.0,
+                 dtype=torch.float32):
+        super().__init__()
+        Bx = torch.randn(n_x, dtype=dtype) * float(sigma_x)
+        Bt = torch.randn(n_t, dtype=dtype) * float(sigma_t)
+        self.register_buffer('Bx', Bx)
+        self.register_buffer('Bt', Bt)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.to(device=self.Bx.device, dtype=self.Bx.dtype)
+        xcol = x[..., 0:1]
+        tcol = x[..., 1:2]
+        zx = xcol * self.Bx  # (N, n_x)
+        zt = tcol * self.Bt  # (N, n_t)
+        feats = [xcol, tcol, torch.sin(zx), torch.cos(zx), torch.sin(zt), torch.cos(zt)]
+        return torch.cat(feats, dim=-1)
 
 class ResidualBlock(torch.nn.Module):
     def __init__(self, dim: int, activation: torch.nn.Module, alpha_init: float = 0.0,
@@ -229,11 +257,13 @@ class PirateNet(torch.nn.Module):
                  output_size: int,
                  hidden_size: int = 128,
                  depth: int = 6,
-                 fourier_features: int = 128,
-                 sigma: float = 10.0,
-                 layer_norm: bool = False,
-                 dropout: float = 0.0,
-                 skip_every: int = 0,
+                 fourier_features: int | None = None,
+                 sigma: float | None = None,
+                 # New: separate features for x and t
+                 x_features: int | None = None,
+                 t_features: int | None = None,
+                 sigma_x: float = 1.0,
+                 sigma_t: float = 1.0,
                  dtype: torch.dtype = torch.float32,
                  use_rwf: bool = False,
                  rwf_mu: float = 1.0,
@@ -243,9 +273,16 @@ class PirateNet(torch.nn.Module):
                  use_sine_embed: bool = False,
                  w0_embed: float = 5.0):
         super().__init__()
-
-        self.ff = FourierFeatures(input_size, fourier_features, sigma, dtype)
-        embed_dim = 2 * fourier_features
+        # Choose embedding: separate per-dim if x_features/t_features provided
+        if x_features is not None and t_features is not None:
+            self.ff = FourierFeaturesXT(x_features, t_features, sigma_x, sigma_t, dtype)
+            embed_dim = 2 + 2 * (x_features + t_features)
+        else:
+            # Fallback to legacy joint features
+            ff = fourier_features if fourier_features is not None else 128
+            sg = sigma if sigma is not None else 1.0
+            self.ff = FourierFeatures(input_size, ff, sg, dtype)
+            embed_dim = 2 * ff
         self.use_sine_embed = bool(use_sine_embed)
         self.w0_embed = float(w0_embed)
 
@@ -310,9 +347,10 @@ class PirateNet(torch.nn.Module):
     @torch.no_grad()
     def physics_init(self,
                                    X: torch.Tensor,
-                                   y: torch.Tensor,
+                                   y: torch.Tensor | None = None,
                                    ridge: float = 1e-6,
-                                   add_bias: bool = False):
+                                   add_bias: bool = True,
+                                   u0: torch.Tensor | None = None):
         """
         Initialize the final linear layer (self.out) via least squares on
         provided (X, y) pairs (e.g., initial condition u(x, t0)).
@@ -322,11 +360,26 @@ class PirateNet(torch.nn.Module):
         """
         device = next(self.parameters()).device
         dtype = next(self.parameters()).dtype
+
         X = X.to(device=device, dtype=dtype)
-        y = y.to(device=device, dtype=dtype)
-        # Ensure y is 2D: (N, out). If given as (N,), unsqueeze to (N,1).
-        if y.ndim == 1:
-            y = y.unsqueeze(1)
+        
+        # Build y from u0 by repeating across time-major blocks,
+        # or by 1D interpolation on x if shapes don't divide evenly.
+        if u0 is None:
+            raise ValueError("physics_init: either y or u0 must be provided")
+        u0 = u0.to(device=device, dtype=dtype).view(-1)
+        N = X.size(0)
+        M = u0.numel()
+        if M > 0 and (N % M) == 0:
+            y = u0.repeat(N // M).unsqueeze(1)
+        else:
+            x_samples = X[:, 0]
+            x_grid = torch.linspace(x_samples.min(), x_samples.max(), steps=M, device=device, dtype=dtype)
+            idx = torch.searchsorted(x_grid, x_samples, right=False).clamp_(1, M - 1)
+            xL = x_grid[idx - 1]; xR = x_grid[idx]
+            yL = u0[idx - 1];     yR = u0[idx]
+            w = (x_samples - xL) / (xR - xL + torch.finfo(dtype).eps)
+            y = (yL + w * (yR - yL)).unsqueeze(1)
 
         H = self.features(X)  # (N, hidden)
         if add_bias:
