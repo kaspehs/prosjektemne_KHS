@@ -36,6 +36,11 @@ class RandomFactorizedLinear(nn.Module):
         nn.init.xavier_uniform_(self.V)
         with torch.no_grad():
             self.s.normal_(mean=self.mu, std=self.sigma)
+            # Rescale V so that E[Var(exp(s) * V)] matches Xavier Var(V).
+            # For s ~ N(mu, sigma^2): E[exp(2s)] = exp(2*mu + 2*sigma^2).
+            # We want alpha^2 * E[exp(2s)] = 1 => alpha = exp(-(mu + sigma^2)).
+            alpha = float(np.exp(-(self.mu + self.sigma**2)))
+            self.V.mul_(alpha)
             if self.bias is not None:
                 self.bias.zero_()
 
@@ -201,6 +206,29 @@ class FourierFeaturesXT(torch.nn.Module):
         feats = [xcol, tcol, torch.sin(zx), torch.cos(zx), torch.sin(zt), torch.cos(zt)]
         return torch.cat(feats, dim=-1)
 
+class PeriodicXFourierFeaturesXT(torch.nn.Module):
+    """Separate RFF with hard-periodic x via [cos(theta), sin(theta)].
+    theta = pi * x / Lx; default Lx=1 for x in [-1,1].
+    Returns features: [cos(theta), sin(theta), t, sin(Bx@enc), cos(Bx@enc), sin(Bt*t), cos(Bt*t)].
+    """
+    def __init__(self, n_x: int, n_t: int, sigma_x: float = 1.0, sigma_t: float = 1.0,
+                 x_period_L: float = 1.0, dtype=torch.float32):
+        super().__init__()
+        self.register_buffer('Bx', torch.randn(n_x, 2, dtype=dtype) * float(sigma_x))
+        self.register_buffer('Bt', torch.randn(n_t, dtype=dtype) * float(sigma_t))
+        self.register_buffer('Lx', torch.tensor(float(x_period_L), dtype=dtype))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.to(device=self.Bx.device, dtype=self.Bx.dtype)
+        xcol = x[..., 0:1]
+        tcol = x[..., 1:2]
+        theta = torch.pi * xcol / self.Lx
+        enc = torch.cat([torch.cos(theta), torch.sin(theta)], dim=-1)  # (N,2)
+        zx = enc @ self.Bx.t()  # (N, n_x)
+        zt = tcol * self.Bt      # (N, n_t)
+        feats = [enc[:, 0:1], enc[:, 1:2], tcol, torch.sin(zx), torch.cos(zx), torch.sin(zt), torch.cos(zt)]
+        return torch.cat(feats, dim=-1)
+
 class ResidualBlock(torch.nn.Module):
     def __init__(self, dim: int, activation: torch.nn.Module, alpha_init: float = 0.0,
                  use_rwf: bool = False, rwf_mu: float = 1.0, rwf_sigma: float = 0.1):
@@ -264,6 +292,8 @@ class PirateNet(torch.nn.Module):
                  t_features: int | None = None,
                  sigma_x: float = 1.0,
                  sigma_t: float = 1.0,
+                 periodic_x: bool = False,
+                 x_period_L: float = 1.0,
                  dtype: torch.dtype = torch.float32,
                  use_rwf: bool = False,
                  rwf_mu: float = 1.0,
@@ -275,8 +305,12 @@ class PirateNet(torch.nn.Module):
         super().__init__()
         # Choose embedding: separate per-dim if x_features/t_features provided
         if x_features is not None and t_features is not None:
-            self.ff = FourierFeaturesXT(x_features, t_features, sigma_x, sigma_t, dtype)
-            embed_dim = 2 + 2 * (x_features + t_features)
+            if periodic_x:
+                self.ff = PeriodicXFourierFeaturesXT(x_features, t_features, sigma_x, sigma_t, x_period_L, dtype)
+                embed_dim = 3 + 2 * (x_features + t_features)
+            else:
+                self.ff = FourierFeaturesXT(x_features, t_features, sigma_x, sigma_t, dtype)
+                embed_dim = 2 + 2 * (x_features + t_features)
         else:
             # Fallback to legacy joint features
             ff = fourier_features if fourier_features is not None else 128
@@ -350,7 +384,8 @@ class PirateNet(torch.nn.Module):
                                    y: torch.Tensor | None = None,
                                    ridge: float = 1e-6,
                                    add_bias: bool = True,
-                                   u0: torch.Tensor | None = None):
+                                   u0: torch.Tensor | None = None, 
+                                   return_diagnostics = True):
         """
         Initialize the final linear layer (self.out) via least squares on
         provided (X, y) pairs (e.g., initial condition u(x, t0)).
@@ -360,7 +395,7 @@ class PirateNet(torch.nn.Module):
         """
         device = next(self.parameters()).device
         dtype = next(self.parameters()).dtype
-
+        X = torch.as_tensor(X, dtype=dtype, device=device)
         X = X.to(device=device, dtype=dtype)
         
         # Build y from u0 by repeating across time-major blocks,
@@ -405,4 +440,26 @@ class PirateNet(torch.nn.Module):
             self.out.weight.data.copy_(W)
             torch.nn.init.zeros_(self.out.bias)
 
-        return theta
+        if not return_diagnostics:
+            return theta
+        else:
+        # Diagnostics
+            y_hat = Phi @ theta                      # (N, out)
+            err   = y_hat - y
+            mse   = (err.pow(2).mean(dim=0))         # per-output
+            rmse  = mse.sqrt()
+            rel_l2 = (err.norm(dim=0) / (y.norm(dim=0).clamp_min(1e-12)))
+            max_abs = err.abs().max(dim=0).values
+            # Coeff magnitudes
+            theta_l2 = theta.norm(dim=0)             # per-output
+            theta_linf = theta.abs().max(dim=0).values
+
+            return {
+                "theta": theta,
+                "rmse": rmse,                        # tensor of size (out,)
+                "rel_l2": rel_l2,                    # tensor of size (out,)
+                "max_abs": max_abs,                  # tensor of size (out,)
+                "theta_l2": theta_l2,
+                "theta_linf": theta_linf,
+                "y_hat_sample": y_hat[:10].detach(), # small peek
+            }

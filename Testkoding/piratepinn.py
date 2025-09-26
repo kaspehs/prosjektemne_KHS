@@ -23,7 +23,7 @@ torch.set_num_threads(1)
 torch.set_num_interop_threads(1)
 
 #Dataset parameters
-x_points, t_points = 100, 400 #Dimentions of dataset
+x_points, t_points = 100, 200 #Dimentions of dataset
 input_size = 2   # number of features in your data
 output_size = 1 #Output size
 
@@ -34,22 +34,22 @@ X0_CONST, L_CONST, T_MIN_CONST, T_MAX_CONST = 0.0, 10.0, 0.0, 10.0
 LOG_RUN_NAME = None  # e.g., "pinn_exp1"; None uses timestamped default
 
 #Architechture parameters
-num_blocks = 1 #Depth of network
+num_blocks = 2 #Depth of networks
 hidden_size = 128  # number of hidden units
 fourier_features = 128
-sigma = 1.0
-num_fourier_features_x = None  # x features
-num_fourier_features_t = None  # t features
-fourier_sigma_x = 8.0
+sigma = 2.0
+num_fourier_features_x = 32  # x features
+num_fourier_features_t = 32  # t features
+fourier_sigma_x = 4.0
 fourier_sigma_t = 2.0
 # Sine embedding for PirateNet's U-branch
 USE_SINE_EMBED = False
 W0_EMBED = 5.0
-n_r = 64 #Batchsize is n_r*num_chunks
+n_r = 128 #Batchsize is n_r*num_chunks
 num_chunks = 16 #Time chunks for causal training
-n_bc = 64 #Number of colocation points for enforcing BCs
-n_ic = 64 #Number of colocation points for enforcing BCs
-use_rwf=True
+n_bc = 1 #Number of colocation points for enforcing BCs
+n_ic = 512 #Number of colocation points for enforcing IC
+use_rwf=False
 rwf_mu = 1.0; rwf_sigma = 0.1
 factorize_output=False
 
@@ -59,9 +59,12 @@ grad_clip_max_norm = 1e5  # gradient clipping threshold (L2 norm)
 causal_weight = 1.0
 lambda_freq = 1000
 grad_norm_alpha = 0.9
+# GradNorm clamp limits (min/max lambda); configurable
+LAMBDA_MIN = 0.1
+LAMBDA_MAX = 10.0
 
 #Learning rate parameters
-base_lr = 1e-4
+base_lr = 1e-3
 decay_rate = 0.9
 decay_steps = 2000
 warmup_steps = 3000
@@ -78,18 +81,18 @@ def main():
     xt = data['xt'] #[number of points][x, t] [[x0->xn, t0], [x0->xn, t1]]
     print(xt)
     print(u_init)
-    # Physics-driven normalization for inputs: x in [-1,1], t in [0,1]; keep u unscaled
+    # Physics-driven normalization for inputs: x in [-1,1], t in [-1,1]; keep u unscaled
     L_range = float(L_CONST - X0_CONST)
     T_range = float(T_MAX_CONST - T_MIN_CONST)
     x_std = 2.0 * (xt[:, 0] - X0_CONST) / max(L_range, 1e-12) - 1.0
-    t_std = (xt[:, 1] - T_MIN_CONST) / max(T_range, 1e-12)
+    t_std = 2.0 * (xt[:, 1] - T_MIN_CONST) / max(T_range, 1e-12) - 1.0
     X_val = np.stack([x_std, t_std], axis=1)
     y_val = g_u[0].reshape(-1, 1)
 
     # Domain in standardized coordinates and IC in physical units
     x0 = torch.tensor(-1.0, dtype=dtype, device=device)
     L  = torch.tensor( 1.0, dtype=dtype, device=device)
-    t_min = torch.tensor(0.0, dtype=dtype, device=device)
+    t_min = torch.tensor(-1.0, dtype=dtype, device=device)
     t_max = torch.tensor(1.0, dtype=dtype, device=device)
     u0 = torch.as_tensor(u_init[0], dtype=dtype, device=device)
 
@@ -103,13 +106,17 @@ def main():
                       t_features=num_fourier_features_t,
                       sigma_x=fourier_sigma_x,
                       sigma_t=fourier_sigma_t,
+                      periodic_x=True,
+                      x_period_L=1.0,
                       dtype=dtype,
+                      use_rwf=use_rwf, rwf_mu=rwf_mu, rwf_sigma=rwf_sigma,
+                      factorize_output=factorize_output,
                       use_sine_embed=USE_SINE_EMBED,
                       w0_embed=W0_EMBED).to(device=device, dtype=dtype)
 
     # Prepare u_mean (we keep u in physical units here) and chain-rule scales
     x_scale = torch.tensor(L_range/2.0, dtype=dtype, device=device)
-    t_scale = torch.tensor(T_range,      dtype=dtype, device=device)
+    t_scale = torch.tensor(T_range/2.0,  dtype=dtype, device=device)
     u_scale = torch.tensor(1.0,          dtype=dtype, device=device)
 
     # TensorBoard writer
@@ -123,13 +130,13 @@ def main():
 
 
     # Initialize the last layer to map features to IC across all times
-    stats = physics_init(model, X_val, u0, add_bias=True, return_diagnostics=True)
+    stats = model.physics_init(X_val, u0 = u0, add_bias=True, return_diagnostics=True)
 
     print('PirateNet Physics Initialization:')
     print("RMSE:", stats["rmse"].cpu().numpy())
     print("rel L2:", stats["rel_l2"].cpu().numpy())
     print("max |err|:", stats["max_abs"].cpu().numpy())
-    print("||theta||_2:", stats["theta_l2"].cpu().numpy(), "cond(Phi):", stats["cond_Phi"])
+    print("||theta||_2:", stats["theta_l2"].cpu().numpy())
 
     # Stepper-based training like pinn.py
     optimizer = optim.Adam(model.parameters(), lr=base_lr)
@@ -140,6 +147,13 @@ def main():
                               n_r, n_bc, n_ic, num_chunks, causal_weight,
                               lambda_freq, log_every_n_steps, writer, x_points,
                               lr_scheduler, grad_norm_alpha)
+    
+    # Apply GradNorm clamp limits from config
+    try:
+        stepper.balancer.w_min = float(LAMBDA_MIN)
+        stepper.balancer.w_max = float(LAMBDA_MAX)
+    except Exception:
+        pass
     
     stepper.define_validation_data(torch.as_tensor(X_val, dtype=dtype), torch.as_tensor(y_val, dtype=dtype))
 

@@ -30,7 +30,8 @@ def d_xx(u, x):  return d(d_x(u, x), x)
 def d_xxx(u, x): return d(d_xx(u, x), x)
 
 def residual_kdv_loss(model,
-                  #Maximum time needed for causal training and chunking, assumed t0 = 0
+                  # Time range for causal chunking in standardized coords
+                  t_min,
                   t_max,
                   #A list of spatial domain collocation points for use in each chunk
                   x_r,
@@ -51,10 +52,11 @@ def residual_kdv_loss(model,
     device = x_r_det.device
     dtype = x_r_det.dtype
 
-    # Build per-chunk time samples uniformly within each interval [t0, t1]
+    # Build per-chunk time samples uniformly within each interval [t0, t1] over [t_min, t_max]
     idx = torch.arange(int(n_chunks), device=device, dtype=dtype)
-    t0 = (idx / float(n_chunks)) * (t_max if torch.is_tensor(t_max) else torch.tensor(float(t_max), device=device, dtype=dtype))
-    t1 = ((idx + 1) / float(n_chunks)) * (t_max if torch.is_tensor(t_max) else torch.tensor(float(t_max), device=device, dtype=dtype))
+    Lt = (t_max - t_min) if torch.is_tensor(t_max) else torch.tensor(float(t_max - t_min), device=device, dtype=dtype)
+    t0 = t_min + (idx / float(n_chunks)) * Lt
+    t1 = t_min + ((idx + 1) / float(n_chunks)) * Lt
     t_r = torch.rand_like(x_r_det) * (t1[:, None] - t0[:, None]) + t0[:, None]  # (n_chunks, n_r)
 
     # Stack inputs and run model once
@@ -239,7 +241,8 @@ class TrainingStepper:
 
         self.device = next(model.parameters()).device
         self.steps = 0
-        self.lam = {'ic': 1.0, 'bc': 1.0, 'res': 1.0}
+        #self.lam = {'ic': 1.0, 'bc': 1.0, 'res': 1.0}
+        self.lam = {'ic': 1.0, 'res': 1.0}
         self.balancer = GradNormBalancer(self.model, self.lam.keys(), alpha = self.alpha)
 
         self.lr = 0.0
@@ -318,18 +321,21 @@ class TrainingStepper:
         )
 
         #Calculate losses
-        residual_loss, terms1 = residual_kdv_loss(self.model, self.t_max, x_r, self.x_scale, self.t_scale, self.u_scale, self.num_chunks, self.causal_weight)
-        bc_loss, terms2 = periodic_bc_loss(self.model, t_bc, self.x0, self.L)
+        residual_loss, terms1 = residual_kdv_loss(self.model, self.t_min, self.t_max, x_r, self.x_scale, self.t_scale, self.u_scale, self.num_chunks, self.causal_weight)
+        #bc_loss, terms2 = periodic_bc_loss(self.model, t_bc, self.x0, self.L)
+        bc_loss, terms2 = torch.tensor(0.0), None
         ic_loss, terms3 = init_condition_loss(self.model, self.u0, x_ic, self.t_min, self.x0, self.L)
         # Freeze λ weights wrt θ
         lam_res = self.lam['res'].detach() if torch.is_tensor(self.lam['res']) else torch.tensor(float(self.lam['res']), device=self.device)
-        lam_bc  = self.lam['bc' ].detach() if torch.is_tensor(self.lam['bc' ]) else torch.tensor(float(self.lam['bc' ]), device=self.device)
+        #lam_bc  = self.lam['bc' ].detach() if torch.is_tensor(self.lam['bc' ]) else torch.tensor(float(self.lam['bc' ]), device=self.device)
         lam_ic  = self.lam['ic' ].detach() if torch.is_tensor(self.lam['ic' ]) else torch.tensor(float(self.lam['ic' ]), device=self.device)
-        loss = residual_loss * lam_res + bc_loss * lam_bc + ic_loss * lam_ic
+        #loss = residual_loss * lam_res + bc_loss * lam_bc + ic_loss * lam_ic
+        loss = residual_loss * lam_res + ic_loss * lam_ic
         
         #Updates loss weighting every lambda_freq steps
         if (self.steps % self.lamda_freq) == 0:
-            self.lam = self.balancer.update({'ic':ic_loss, 'bc': bc_loss, 'res': residual_loss})
+            #self.lam = self.balancer.update({'ic':ic_loss, 'bc': bc_loss, 'res': residual_loss})
+            self.lam = self.balancer.update({'ic':ic_loss, 'res': residual_loss})
 
         #Backpropagation
         self.optimizer.zero_grad(set_to_none=True)

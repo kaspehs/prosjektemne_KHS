@@ -1,0 +1,94 @@
+config1:
+num_blocks = 1
+fourier_features = 64
+sigma = 2.0
+n_r = 128
+num_chunks = 16
+n_bc = 128
+n_ic = 128
+use_rwf=False
+rwf_mu = 1.0; rwf_sigma = 0.1
+factorize_output=False
+
+#Optimization parameters
+total_steps = int(1e5)
+grad_clip_max_norm = 1e5  # gradient clipping threshold (L2 norm)
+causal_weight = 1.0
+lambda_freq = 1000
+grad_norm_alpha = 0.9
+
+#Learning rate parameters
+base_lr = 3e-4
+decay_rate = 0.9
+decay_steps = 2000
+warmup_steps = 3000
+
+config2: 
+config1// num_blocks=2
+
+config3:
+config1// fourier_features=128
+
+config4:
+config1// rwf= TRUE, 1.0, 0.01
+
+config5:
+config1// rwf= TRUE, 0.0, 0.01
+
+config6:
+config1// rwf_FIXED= TRUE, 1.0, 0.1
+
+config7:
+config1// LR=1e-3
+
+config8:
+config1// GradNorm=False
+
+config9:
+config1// GradNorm=w_min, w_max=0,3-3
+
+config10:
+config1// GradNorm=w_min, w_max=0.01-100
+
+config11:
+condfig1// sigma=4.0
+
+config12:
+condfig1// sigma=1.0
+
+config13:
+condfig1// samplig x2
+
+config14:
+condfig1// ic, bc sampling x2
+
+config15:
+condfig1// ic, bc sampling x4
+
+config16:
+condfig1// res sampling x0.5
+
+config17:
+condfig1// grad_clip = 200
+
+config18:
+condfig1// num_chunks = 32
+
+config19:
+condfig1// num_chunks = 8
+
+config20:
+condfig1// SIREN = True
+
+
+
+
+
+
+
+To try: 
+Try SIREN embedding(look at init first)
+Try decoupled FF
+No physics init
+Ordinary MLP
+
