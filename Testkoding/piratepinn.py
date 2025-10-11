@@ -34,12 +34,12 @@ X0_CONST, L_CONST, T_MIN_CONST, T_MAX_CONST = 0.0, 10.0, 0.0, 10.0
 LOG_RUN_NAME = None  # e.g., "pinn_exp1"; None uses timestamped default
 
 #Architechture parameters
-num_blocks = 2 #Depth of networks
+num_blocks = 1 #Depth of networks
 hidden_size = 128  # number of hidden units
 fourier_features = 128
 sigma = 2.0
-num_fourier_features_x = 32  # x features
-num_fourier_features_t = 32  # t features
+num_fourier_features_x = 16  # x features
+num_fourier_features_t = 16  # t features
 fourier_sigma_x = 4.0
 fourier_sigma_t = 2.0
 # Sine embedding for PirateNet's U-branch
@@ -49,7 +49,7 @@ n_r = 128 #Batchsize is n_r*num_chunks
 num_chunks = 16 #Time chunks for causal training
 n_bc = 1 #Number of colocation points for enforcing BCs
 n_ic = 512 #Number of colocation points for enforcing IC
-use_rwf=False
+use_rwf=True
 rwf_mu = 1.0; rwf_sigma = 0.1
 factorize_output=False
 
@@ -60,8 +60,8 @@ causal_weight = 1.0
 lambda_freq = 1000
 grad_norm_alpha = 0.9
 # GradNorm clamp limits (min/max lambda); configurable
-LAMBDA_MIN = 0.1
-LAMBDA_MAX = 10.0
+LAMBDA_MIN = 0.3
+LAMBDA_MAX = 3.0
 
 #Learning rate parameters
 base_lr = 1e-3
