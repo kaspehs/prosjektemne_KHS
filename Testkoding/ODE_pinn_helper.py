@@ -80,8 +80,8 @@ def residual_viv_loss(model, device, dtype,
     q_scale = ODE_params['q_scale']
 
 
-    y_res = my * ytt + cy * yt + ky * y + k3y * y**3 - Kl * q
-    q_res = qtt + cq * (q**2-1.0) * qt + kq * q - Kc * ytt
+    y_res = my * ytt + cy * yt + ky * y + k3y * y**3# - Kl * q
+    q_res = qtt + cq * (q**2-1.0) * qt + kq * q# - Kc * ytt
 
     #Scaling the residuals
     y_res = y_res/y_scale
@@ -114,6 +114,152 @@ def residual_viv_loss(model, device, dtype,
         "wi": wi_log,
         "kept": processed,
     }
+
+def residual_viv_weak_loss(model, device, dtype,
+                  # Time range for causal chunking in standardized coords
+                  t_qp, c, J, W,
+                  # scales for inputs and outputs for the PDE
+                  t_scale,
+                  #ODE parameters
+                  ODE_params,
+                  #Number of time domain chunks
+                  edges, lengths,
+                  n_chunks,
+                  n_per_chunk: int = 128,
+                  #How much the model has to learn the early time stages before the latter
+                  causal_weight: float = 1.0,
+                ):
+  
+    n_qp = n_per_chunk
+
+    t_qp_req = t_qp.reshape(-1, 1).requires_grad_(True)
+    pred = model(t_qp_req)
+    y = pred[:, 0:1]; q = pred[:, 1:2]
+    y_tau = d(y, t_qp_req); q_tau = d(q, t_qp_req)
+    yt = y_tau / t_scale; qt = q_tau / t_scale
+
+    # reshape back to (n_chunks, n_qp, 1)
+    y_qp  = y.view(n_chunks, n_qp, 1)
+    q_qp  = q.view(n_chunks, n_qp, 1)
+    yt_qp = yt.view(n_chunks, n_qp, 1)
+    qt_qp = qt.view(n_chunks, n_qp, 1)
+
+    # --- build Petrov-Galerkin test functions per chunk ---
+    # map qp times to local ξ in [-1,1] with current edges
+    xi_qp = (t_qp - c[:, None]) / J[:, None]  # (n_chunks, n_qp)
+    n_test = 3
+    Ry_modes, Rq_modes = [], []
+
+    for m in range(1, n_test+1):
+        phi = torch.sin(m*torch.pi * (xi_qp + 1.0) * 0.5)               # (n_chunks, n_qp)
+        dphi_dxi = (m*torch.pi*0.5) * torch.cos(m*torch.pi * (xi_qp + 1.0) * 0.5)
+        dphi_dt = dphi_dxi / J[:, None]                                  # (n_chunks, n_qp)
+
+        phi_e     = phi.unsqueeze(-1)          # (n_chunks, n_qp, 1)
+        dphi_dt_e = dphi_dt.unsqueeze(-1)         # (n_chunks, n_qp, 1)
+
+        # unpack ODE params (your dict)
+        my  = ODE_params['my'];  cy  = ODE_params['cy'];  ky  = ODE_params['ky']
+        k3y = ODE_params['k3y']; Kl  = ODE_params['Kl']
+        cq  = ODE_params['cq'];  kq  = ODE_params['kq'];  Kc  = ODE_params['Kc']
+        y_scale = ODE_params['y_scale']; q_scale = ODE_params['q_scale']
+
+        # weak integrands (no second derivatives)
+        integrand_y = (-my * dphi_dt_e * yt_qp
+                       + cy * phi_e * yt_qp
+                       + ky * phi_e * y_qp
+                       + k3y * phi_e * (y_qp**3)
+                       - Kl * phi_e * q_qp)
+
+        integrand_q = (-dphi_dt_e * qt_qp
+                       + cq * phi_e * ((q_qp**2) - 1.0) * qt_qp
+                       + kq * phi_e * q_qp
+                       + Kc * dphi_dt_e * yt_qp)
+
+        # quadrature sum over qp: sum_j w_j * integrand(t_j) * J  (W already has J)
+        Ry_m = (integrand_y.squeeze(-1) * W).sum(dim=1)  # (n_chunks,)
+        Rq_m = (integrand_q.squeeze(-1) * W).sum(dim=1)  # (n_chunks,)
+
+        Ry_modes.append(Ry_m / y_scale)
+        Rq_modes.append(Rq_m / q_scale)
+
+    Ry = torch.stack(Ry_modes, dim=1)   # (n_chunks, n_test)
+    Rq = torch.stack(Rq_modes, dim=1)
+
+    if causal_weight > 0.0:
+        per_chunk_loss = torch.mean(Ry**2, dim = 1) + torch.mean(Rq**2, dim = 1) #Mean over square of test function errors
+        # Causal weighting applied sequentially but without extra model calls
+        chunk_losses: list[torch.Tensor] = []
+        residual_loss = Ry.new_zeros(())
+        wi_log = [0.0] * int(n_chunks)
+        processed = 0
+        for M in range(int(n_chunks)):
+            prev = (torch.stack(chunk_losses).sum().detach() if chunk_losses else Ry.new_zeros(())).detach()
+            wi = torch.exp(-float(causal_weight) * prev).detach()
+            wi_log[M] = float(wi)
+            loss_m = per_chunk_loss[M]
+            residual_loss = residual_loss + wi * loss_m
+            chunk_losses.append(loss_m.detach())
+            processed += 1
+
+        denom = float(processed if processed > 0 else 1)
+        residual_loss = residual_loss / denom
+
+        return residual_loss, {
+            "residual": residual_loss.item(),
+            "wi": wi_log,
+            "kept": processed,
+        }
+
+    else:
+        residual_loss = (Ry**2 + Rq**2).mean()
+        return residual_loss, {
+            "residual": residual_loss.item(),
+            "wi": None,
+            "kept": None,
+        }
+
+def dirichlet_edges(t0, T, n_chunks, alpha=5.0,*, device, dtype, seed=None):
+    if seed is not None:
+        g = torch.Generator(device=device)
+        g.manual_seed(seed)
+    else:
+        g = None
+    conc = torch.full((n_chunks,), float(alpha), device=device, dtype=dtype)
+    p = torch.distributions.Dirichlet(conc).sample(generator=g)           # (n_chunks,)
+    lengths = p * (T - t0)                                                # positive, sums to T-t0
+    edges = torch.cat([torch.tensor([t0], device=device, dtype=dtype),
+                       t0 + torch.cumsum(lengths, dim=0)])                 # (n_chunks+1,)
+    return edges, lengths  # edges[0]=t0, edges[-1]=T
+
+def dirichlet_edges_bounded(t0, T, n_chunks, alpha=5.0, min_frac=0.5, max_frac=1.5, *, device, dtype, seed=None):
+    # Mean target
+    mean_len = (T - t0) / n_chunks
+    ell_min = min_frac * mean_len
+    ell_max = max_frac * mean_len
+
+    edges, lengths = dirichlet_edges(t0, T, n_chunks, alpha, device=device, dtype=dtype, seed=seed)
+
+    # Project lengths to [ell_min, ell_max], then renormalize to sum to (T-t0)
+    L = lengths.clone()
+    L = torch.clamp(L, min=ell_min, max=ell_max)
+    scale = (T - t0) / L.sum()
+    L = L * scale
+
+    edges = torch.cat([torch.tensor([t0], device=device, dtype=dtype),
+                       t0 + torch.cumsum(L, dim=0)])
+    return edges, L
+
+def quadrature_from_edges(edges, xi, w):
+    # edges: (n_chunks+1,) ; xi,w: Gauss-Legendre nodes/weights on [-1,1]
+    t_a, t_b = edges[:-1], edges[1:]               # (n_chunks,)
+    c = 0.5*(t_a + t_b)                            # centers
+    J = 0.5*(t_b - t_a)                            # Jacobians (half-lengths)
+
+    # broadcast nodes to each chunk: t = c + J*xi
+    t_qp = c[:, None] + J[:, None] * xi[None, :]   # (n_chunks, n_qp)
+    W = (w[None, :] * J[:, None])                  # scaled weights per chunk
+    return t_a, t_b, c, J, t_qp, W
 
 def init_condition_loss(model,
         # IC ground truth, IC collocatin points at t=O
@@ -219,7 +365,8 @@ class ODETrainingStepper:
                 log_every_n_steps, writer, lr_scheduler, alpha,
                 diameter: float = 1.0,
                 y_plot_limit: float = 1.0,
-                q_plot_limit: float = 1.0): #Logging spesific parameters
+                q_plot_limit: float = 1.0, 
+                vPINN = False): #Logging spesific parameters
         self.model = model
         self.t_min = t_min; self.t_max = t_max; self.t_scale = t_scale; self.u_ic = u_ic
         self.ODE_params = ODE_params
@@ -231,6 +378,7 @@ class ODETrainingStepper:
         self.diameter = float(diameter) if diameter != 0 else 1.0
         self.y_plot_limit = float(y_plot_limit) if y_plot_limit > 0 else 1.0
         self.q_plot_limit = float(q_plot_limit) if q_plot_limit > 0 else 1.0
+        self.vPINN = vPINN
 
         self.device = next(model.parameters()).device
         self.dtype = next(model.parameters()).dtype
@@ -243,6 +391,11 @@ class ODETrainingStepper:
 
         self.xb = None; self.yb = None
         self.y_min = None; self.y_max = None
+
+        if vPINN:
+            xi_np, w_np = torch.polynomial.legendre.leggauss(n_per_chunk)
+            self.xi = torch.tensor(xi_np, device=self.device, dtype=self.dtype)
+            self.w  = torch.tensor(w_np,  device=self.device, dtype=self.dtype)
 
     def define_validation_data(self, xb, yb):
         self.xb = xb; self.yb = yb
@@ -304,10 +457,17 @@ class ODETrainingStepper:
             self.lr = self.lr_scheduler.get_lr(self.steps)
             g["lr"] = self.lr
 
-        #Calculate losses
-        residual_loss, terms1 = residual_viv_loss(self.model, self.device, self.dtype, self.t_min, self.t_max, self.t_scale, 
-                                                  self.ODE_params,
-                                                  self.num_chunks, self.n_per_chunk, self.causal_weight)
+        if self.vPINN:
+            if self.steps % 20 == 0:
+                edges, _ = dirichlet_edges_bounded(self.t_min, self.t_max, self.num_chunks, device=self.device, dtype=self.dtype)
+                t_a, t_b, c, J, t_qp, W = quadrature_from_edges(edges, self.xi, self.w)
+
+
+        else:
+            #Calculate losses
+            residual_loss, terms1 = residual_viv_loss(self.model, self.device, self.dtype, self.t_min, self.t_max, self.t_scale, 
+                                                    self.ODE_params,
+                                                    self.num_chunks, self.n_per_chunk, self.causal_weight)
         #bc_loss, terms2 = periodic_bc_loss(self.model, t_bc, self.x0, self.L)
         bc_loss, terms2 = torch.tensor(0.0), None
         ic_loss, terms3 = init_condition_loss(self.model, self.u_ic, self.t_min, self.t_scale)

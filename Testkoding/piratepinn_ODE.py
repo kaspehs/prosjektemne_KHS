@@ -29,8 +29,8 @@ input_size = 1   # number of features in your data
 output_size = 2 #Output size
 
 # Plot visualization limits
-Y_PLOT_LIMIT = 1.0
-Q_PLOT_LIMIT = 1.0
+Y_PLOT_LIMIT = 2.0
+Q_PLOT_LIMIT = 2.0
 
 # Load shared ODE configuration
 ode_setup = build_ode_setup()

@@ -26,8 +26,8 @@ class ODEConfig:
     eta_y: float = 0.4
 
     # Initial conditions (amplitude and wake value)
-    A0: float = 0.2
-    q0: float = 0.4
+    A0: float = 1
+    q0: float = 1
 
     # Time span in physical coordinates
     T_min: float = 0.0
