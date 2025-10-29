@@ -33,6 +33,10 @@ dt = 0.001                # time step
 T = 50                  # 
 N = int(np.ceil(T/dt))
 
+U_r = 2*np.pi * U / D * np.sqrt((M + D**2*np.pi/4*rho)/K)
+
+print(f'Reduced velocity: {U_r}')
+
 # preallocate space
 time = np.zeros(N)   # time
 y = np.zeros(N)      # displacement in y dir (CF)
