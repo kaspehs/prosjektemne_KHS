@@ -16,7 +16,8 @@ from architectures import BasicMLP, SirenMLP
 from ODE import build_ode_setup, print_ode_summary
 
 # Prefer Apple GPU (MPS) if available; use float32 for stability/speed
-device = torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
+#device = torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
+device = torch.device("cpu")
 dtype = torch.float32
 torch.set_default_dtype(dtype)
 torch.set_num_threads(1)
@@ -28,8 +29,8 @@ input_size = 1
 output_size = 2
 
 # Plot limits (normalized displacement y/D and wake variable q)
-Y_PLOT_LIMIT = 1.0
-Q_PLOT_LIMIT = 1.0
+Y_PLOT_LIMIT = 2.0
+Q_PLOT_LIMIT = 2.0
 
 # Load shared ODE configuration
 ode_setup = build_ode_setup()
@@ -46,18 +47,21 @@ num_hidden_layers = 4
 hidden_size = 128
 USE_RFF = True
 FOURIER_FEATURES = 64
-FOURIER_SIGMA = 15.0
+FOURIER_SIGMA = 30.0
 USE_SIREN = True
 SIREN_W0 = 30.0
 SIREN_W0_HIDDEN = 1.0
-num_chunks = 1
-n_per_chunk = 2048
+num_chunks = 64
+n_per_chunk = 32
+chunk_dirichlet_alpha = 5.0  # Dirichlet concentration for random chunk lengths
+chunk_length_min_frac = 0.5  # Minimum chunk length relative to uniform average
+chunk_length_max_frac = 1.5  # Maximum chunk length relative to uniform average
 
 # Basic fully-connected network (no Fourier features / RWF)
 # Optimisation / training parameters
 total_steps = int(5e4)
 grad_clip_max_norm = 1e5
-causal_weight = 0.0
+causal_weight = 5.0
 lambda_freq = 1000
 grad_norm_alpha = 0.9
 
@@ -68,6 +72,7 @@ warmup_steps = 3000
 
 steps_per_log_plot = 1000
 log_every_n_steps = 100
+dirac_val_points = 1024  # Number of deterministic Dirac validation samples
 
 def main():
     # Prepare plotting grid (only used for visualisation)
@@ -126,9 +131,14 @@ def main():
         writer,
         lr_scheduler,
         grad_norm_alpha,
+        chunk_alpha=chunk_dirichlet_alpha,
+        chunk_min_frac=chunk_length_min_frac,
+        chunk_max_frac=chunk_length_max_frac,
+        dirac_val_points=dirac_val_points,
         diameter=D,
         y_plot_limit=Y_PLOT_LIMIT,
         q_plot_limit=Q_PLOT_LIMIT,
+        vPINN = True
     )
 
     # Initial diagnostic plot

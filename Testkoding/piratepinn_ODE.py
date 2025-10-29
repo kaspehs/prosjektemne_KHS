@@ -7,7 +7,6 @@ _os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
 _os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
 import torch
-import torch.nn as nn
 import torch.optim as optim
 import numpy as np
 from torch.utils.tensorboard import SummaryWriter
@@ -18,6 +17,7 @@ from ODE import build_ode_setup, print_ode_summary
 
 # Prefer Apple GPU (MPS) if available; use float32 for stability/speed
 device = torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
+device = torch.device("cpu")
 dtype = torch.float32
 torch.set_default_dtype(dtype)
 torch.set_num_threads(1)
@@ -45,23 +45,26 @@ print_ode_summary(ode_setup)
 LOG_RUN_NAME = None  # e.g., "pinn_exp1"; None uses timestamped default
 
 #Architechture parameters
-num_blocks = 2 #Depth of networks
+num_blocks = 3 #Depth of networks
 hidden_size = 64  # number of hidden units
-fourier_features = 64
-sigma = 30.0
+fourier_features = 128
+sigma = 32.0
 # Sine embedding for PirateNet's U-branch
 USE_SINE_EMBED = False
 W0_EMBED = 5.0
-num_chunks = 8 #Time chunks for causal training
-n_per_chunk = 256
-use_rwf=False
+num_chunks = 64 #Time chunks for causal training
+n_per_chunk = 8
+chunk_dirichlet_alpha = 3.0  # Dirichlet concentration for random chunk lengths
+chunk_length_min_frac = 0.3  # Minimum chunk length relative to uniform average
+chunk_length_max_frac = 3  # Maximum chunk length relative to uniform average
+use_rwf=True
 rwf_mu = 1.0; rwf_sigma = 0.1
 factorize_output=False
 
 #Optimization parameters
-total_steps = int(5e4)
+total_steps = int(2e5)
 grad_clip_max_norm = 1e5  # gradient clipping threshold (L2 norm)
-causal_weight = 5.0
+causal_weight = 1.0
 lambda_freq = 1000
 grad_norm_alpha = 0.9
 # GradNorm clamp limits (min/max lambda); configurable
@@ -72,11 +75,12 @@ LAMBDA_MAX = 5.0
 base_lr = 1e-3
 decay_rate = 0.9
 decay_steps = 2000
-warmup_steps = 3000
+warmup_steps = 5000
 
 #Logging parameters
-steps_per_heatmap = 500  # log heatmap figures to TensorBoard every N epochs (0 to disable)
+steps_per_heatmap = 5000  # log heatmap figures to TensorBoard every N epochs (0 to disable)
 log_every_n_steps = 100
+dirac_val_points = 1024  # Number of deterministic Dirac validation samples
 
 def main():
     #Loading the data
@@ -128,8 +132,14 @@ def main():
                               optimizer, grad_clip_max_norm,
                               n_per_chunk, num_chunks, causal_weight,
                               lambda_freq, log_every_n_steps, writer,
-                              lr_scheduler, grad_norm_alpha, diameter=D,
-                              y_plot_limit=Y_PLOT_LIMIT, q_plot_limit=Q_PLOT_LIMIT)
+                              lr_scheduler, grad_norm_alpha,
+                              chunk_alpha=chunk_dirichlet_alpha,
+                              chunk_min_frac=chunk_length_min_frac,
+                              chunk_max_frac=chunk_length_max_frac,
+                              dirac_val_points=dirac_val_points,
+                              diameter=D,
+                              y_plot_limit=Y_PLOT_LIMIT, q_plot_limit=Q_PLOT_LIMIT, 
+                              vPINN = True)
     
     # Apply GradNorm clamp limits from config
     try:

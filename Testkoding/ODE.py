@@ -11,27 +11,31 @@ class ODEConfig:
     """Physical constants and empirical coefficients for the VIV ODE system."""
 
     # Physical properties
-    mass_ratio: float = 2.0
+    mass_ratio: float = 4.0
     Tny: float = 1.0
     D: float = 0.2
-    zeta: float = 0.002
+    zeta: float = 0.01
     St: float = 0.2
     Ca: float = 1.0
     rho: float = 1025.0
-    CL0: float = 0.8
-    Vr: float = 5.0
+    CL0: float = 0.3
+    Vr: float = 6.0
 
     # Empirical wake coupling parameters
-    coupling_coeff: float = 0.8
-    eta_y: float = 0.4
+    coupling_coeff: float = 0.3
+    eta_y: float = 0.5
+
+    #Relative cubic stiffness
+    r = 0.05
+    target_amplitude = 0.1
 
     # Initial conditions (amplitude and wake value)
-    A0: float = 1
-    q0: float = 1
+    A0: float = 0.01
+    q0: float = 0.4
 
     # Time span in physical coordinates
     T_min: float = 0.0
-    T_max: float = 5.0
+    T_max: float = 20.0
 
 
 def build_ode_setup(config: ODEConfig | None = None) -> Dict[str, Any]:
@@ -49,7 +53,7 @@ def build_ode_setup(config: ODEConfig | None = None) -> Dict[str, Any]:
     my = (cfg.mass_ratio + cfg.Ca) * mf
     cy = 2.0 * cfg.zeta * my * omegany
     ky = omegany**2 * my
-    k3y = 0.0  # Duffing term disabled by default; adjust in config if needed.
+    k3y = cfg.r * ky / (cfg.D*cfg.target_amplitude)**2  # Duffing term disabled by default; adjust in config if needed.
     Kl = 0.5 * cfg.rho * U**2 * cfg.D * cfg.CL0
 
     cq = cfg.eta_y * omegaf

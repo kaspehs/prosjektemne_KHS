@@ -80,8 +80,8 @@ def residual_viv_loss(model, device, dtype,
     q_scale = ODE_params['q_scale']
 
 
-    y_res = my * ytt + cy * yt + ky * y + k3y * y**3# - Kl * q
-    q_res = qtt + cq * (q**2-1.0) * qt + kq * q# - Kc * ytt
+    y_res = my * ytt + cy * yt + ky * y + k3y * y**3 - Kl * q
+    q_res = qtt + cq * (q**2-1.0) * qt + kq * q - Kc * ytt
 
     #Scaling the residuals
     y_res = y_res/y_scale
@@ -180,8 +180,11 @@ def residual_viv_weak_loss(model, device, dtype,
         Ry_m = (integrand_y.squeeze(-1) * W).sum(dim=1)  # (n_chunks,)
         Rq_m = (integrand_q.squeeze(-1) * W).sum(dim=1)  # (n_chunks,)
 
-        Ry_modes.append(Ry_m / y_scale)
-        Rq_modes.append(Rq_m / q_scale)
+        #Ry_modes.append(Ry_m / y_scale)
+        #Rq_modes.append(Rq_m / q_scale)
+
+        Ry_modes.append(Ry_m)
+        Rq_modes.append(Rq_m)
 
     Ry = torch.stack(Ry_modes, dim=1)   # (n_chunks, n_test)
     Rq = torch.stack(Rq_modes, dim=1)
@@ -220,13 +223,8 @@ def residual_viv_weak_loss(model, device, dtype,
         }
 
 def dirichlet_edges(t0, T, n_chunks, alpha=5.0,*, device, dtype, seed=None):
-    if seed is not None:
-        g = torch.Generator(device=device)
-        g.manual_seed(seed)
-    else:
-        g = None
     conc = torch.full((n_chunks,), float(alpha), device=device, dtype=dtype)
-    p = torch.distributions.Dirichlet(conc).sample(generator=g)           # (n_chunks,)
+    p = torch.distributions.Dirichlet(conc).sample()           # (n_chunks,)
     lengths = p * (T - t0)                                                # positive, sums to T-t0
     edges = torch.cat([torch.tensor([t0], device=device, dtype=dtype),
                        t0 + torch.cumsum(lengths, dim=0)])                 # (n_chunks+1,)
@@ -363,6 +361,10 @@ class ODETrainingStepper:
                 optimizer, grad_clip_max_norm, #Optimizer spesific parameters
                 n_per_chunk, num_chunks, causal_weight, lambda_freq, #Training spesific parameters
                 log_every_n_steps, writer, lr_scheduler, alpha,
+                chunk_alpha: float = 5.0,
+                chunk_min_frac: float = 0.5,
+                chunk_max_frac: float = 1.5,
+                dirac_val_points: int | None = None,
                 diameter: float = 1.0,
                 y_plot_limit: float = 1.0,
                 q_plot_limit: float = 1.0, 
@@ -375,6 +377,10 @@ class ODETrainingStepper:
         self.causal_weight = causal_weight; self.lamda_freq = lambda_freq
         self.log_every_n_steps = log_every_n_steps; self.writer = writer
         self.lr_scheduler = lr_scheduler; self.alpha = alpha
+        self.chunk_alpha = float(chunk_alpha)
+        self.chunk_min_frac = float(chunk_min_frac)
+        self.chunk_max_frac = float(chunk_max_frac)
+        self.dirac_val_points = int(dirac_val_points) if dirac_val_points else 0
         self.diameter = float(diameter) if diameter != 0 else 1.0
         self.y_plot_limit = float(y_plot_limit) if y_plot_limit > 0 else 1.0
         self.q_plot_limit = float(q_plot_limit) if q_plot_limit > 0 else 1.0
@@ -382,18 +388,35 @@ class ODETrainingStepper:
 
         self.device = next(model.parameters()).device
         self.dtype = next(model.parameters()).dtype
+        self.val_dirac_t = None
+        if self.dirac_val_points > 0:
+            if isinstance(self.t_min, torch.Tensor):
+                t_min_val = float(self.t_min.detach().cpu().item())
+            else:
+                t_min_val = float(self.t_min)
+            if isinstance(self.t_max, torch.Tensor):
+                t_max_val = float(self.t_max.detach().cpu().item())
+            else:
+                t_max_val = float(self.t_max)
+            self.val_dirac_t = torch.linspace(
+                t_min_val,
+                t_max_val,
+                steps=self.dirac_val_points,
+                device=self.device,
+                dtype=self.dtype,
+            ).view(-1, 1)
 
         self.steps = 0
         self.lam = {'ic': 1.0, 'res': 1.0}
         self.balancer = GradNormBalancer(self.model, self.lam.keys(), alpha = self.alpha)
 
         self.lr = 0.0
-
+        self.chunk_lengths = None
         self.xb = None; self.yb = None
         self.y_min = None; self.y_max = None
 
         if vPINN:
-            xi_np, w_np = torch.polynomial.legendre.leggauss(n_per_chunk)
+            xi_np, w_np = np.polynomial.legendre.leggauss(n_per_chunk)
             self.xi = torch.tensor(xi_np, device=self.device, dtype=self.dtype)
             self.w  = torch.tensor(w_np,  device=self.device, dtype=self.dtype)
 
@@ -406,19 +429,82 @@ class ODETrainingStepper:
         data_loss, terms = mse_data_loss(self.model, self.xb, self.yb)
         return data_loss
 
+    def _validate_dirac(self):
+        if self.val_dirac_t is None:
+            return None
+
+        prev_mode = self.model.training
+        self.model.train(False)
+        try:
+            with torch.enable_grad():
+                t_eval = self.val_dirac_t.detach().clone().requires_grad_(True)
+                pred = self.model(t_eval)
+                y = pred[:, 0:1]
+                q = pred[:, 1:2]
+
+                y_t_hat = d(y, t_eval)
+                y_tt_hat = d(y_t_hat, t_eval)
+                q_t_hat = d(q, t_eval)
+                q_tt_hat = d(q_t_hat, t_eval)
+
+                t_scale = self.t_scale
+                yt = y_t_hat / t_scale
+                ytt = y_tt_hat / (t_scale ** 2)
+                qt = q_t_hat / t_scale
+                qtt = q_tt_hat / (t_scale ** 2)
+
+                params = self.ODE_params
+                my = float(params["my"])
+                cy = float(params["cy"])
+                ky = float(params["ky"])
+                k3y = float(params["k3y"])
+                Kl = float(params["Kl"])
+                cq = float(params["cq"])
+                kq = float(params["kq"])
+                Kc = float(params["Kc"])
+                y_scale = float(params["y_scale"])
+                q_scale = float(params["q_scale"])
+
+                y_res = my * ytt + cy * yt + ky * y + k3y * y**3 - Kl * q
+                q_res = qtt + cq * (q**2 - 1.0) * qt + kq * q - Kc * ytt
+
+                y_res = y_res# / y_scale
+                q_res = q_res# / q_scale
+
+                y_mse = (y_res ** 2).mean()
+                q_mse = (q_res ** 2).mean()
+                total = (y_res ** 2 + q_res ** 2).mean()
+                max_abs = torch.max(torch.stack([y_res.abs().max(), q_res.abs().max()]))
+
+            return {
+                "total": float(total.detach().cpu()),
+                "y": float(y_mse.detach().cpu()),
+                "q": float(q_mse.detach().cpu()),
+                "max_abs": float(max_abs.detach().cpu()),
+            }
+        finally:
+            self.model.train(prev_mode)
+
     def _log(self,
                       train: dict,
                       #val_data_loss: float,
+                      val_dirac: dict | None = None,
                       grad_norm_mean: float | None = None):
-        self.writer.add_scalar('lr', self.lr, self.steps)
-        self.writer.add_scalar('loss/train/total', train.get('total', float('nan')), self.steps)
-        self.writer.add_scalar('loss/train/res', train.get('res', float('nan')), self.steps)
-        self.writer.add_scalar('loss/train/ic', train.get('ic', float('nan')), self.steps)
-        self.writer.add_scalar('loss/train/bc', train.get('bc', float('nan')), self.steps)
-        #self.writer.add_scalar('loss/val/data', val_data_loss, self.steps)
+        self.writer.add_scalar('train/lr', self.lr, self.steps)
+        self.writer.add_scalar('train/loss_total', train.get('total', float('nan')), self.steps)
+        self.writer.add_scalar('train/loss_residual', train.get('res', float('nan')), self.steps)
+        self.writer.add_scalar('train/loss_ic', train.get('ic', float('nan')), self.steps)
+        self.writer.add_scalar('train/loss_bc', train.get('bc', float('nan')), self.steps)
+        #self.writer.add_scalar('val/data_loss', val_data_loss, self.steps)
+
+        if val_dirac is not None:
+            self.writer.add_scalar('val/dirac_total', val_dirac.get('total', float('nan')), self.steps)
+            self.writer.add_scalar('val/dirac_y', val_dirac.get('y', float('nan')), self.steps)
+            self.writer.add_scalar('val/dirac_q', val_dirac.get('q', float('nan')), self.steps)
+            self.writer.add_scalar('val/dirac_max_abs', val_dirac.get('max_abs', float('nan')), self.steps)
 
         if grad_norm_mean is not None:
-            self.writer.add_scalar('grad/total_norm_mean', grad_norm_mean, self.steps)
+            self.writer.add_scalar('train/grad_total_norm_mean', grad_norm_mean, self.steps)
 
         # Log current lambda weights for losses (res, bc, ic)
         try:
@@ -442,12 +528,20 @@ class ODETrainingStepper:
         except Exception:
             pass
 
-        print(
-        f"Epoch {self.steps+1:02d} "
-        f"train(total={train.get('total', float('nan')):.3e}, res={train.get('res', float('nan')):.3e}, bc={train.get('bc', float('nan')):.3e}), ic={train.get('ic', float('nan')):.3e} "
-        #f"val(data={val_data_loss:.3e}) "
-        f"[lr={self.lr:.3e}]"
+        msg = (
+            f"Epoch {self.steps+1:02d} "
+            f"train(total={train.get('total', float('nan')):.3e}, res={train.get('res', float('nan')):.3e}, bc={train.get('bc', float('nan')):.3e}), "
+            f"ic={train.get('ic', float('nan')):.3e}"
+        )
+        if val_dirac is not None:
+            msg += (
+                f", val_dirac(total={val_dirac.get('total', float('nan')):.3e}, "
+                f"y={val_dirac.get('y', float('nan')):.3e}, "
+                f"q={val_dirac.get('q', float('nan')):.3e}, "
+                f"max|res|={val_dirac.get('max_abs', float('nan')):.3e})"
             )
+        msg += f" [lr={self.lr:.3e}]"
+        print(msg)
 
     def step(self):
         self.steps += 1
@@ -458,11 +552,21 @@ class ODETrainingStepper:
             g["lr"] = self.lr
 
         if self.vPINN:
-            if self.steps % 20 == 0:
-                edges, _ = dirichlet_edges_bounded(self.t_min, self.t_max, self.num_chunks, device=self.device, dtype=self.dtype)
-                t_a, t_b, c, J, t_qp, W = quadrature_from_edges(edges, self.xi, self.w)
+            if self.steps % 20 == 0 or self.steps == 1:
+                self.edges, self.chunk_lengths = dirichlet_edges_bounded(
+                    self.t_min,
+                    self.t_max,
+                    self.num_chunks,
+                    alpha=self.chunk_alpha,
+                    min_frac=self.chunk_min_frac,
+                    max_frac=self.chunk_max_frac,
+                    device=self.device,
+                    dtype=self.dtype,
+                )
+                self.t_a, self.t_b, self.c, self.J, self.t_qp, self.W = quadrature_from_edges(self.edges, self.xi, self.w)
 
-
+            residual_loss, terms1 = residual_viv_weak_loss(self.model, self.device, self.dtype, self.t_qp, self.c, self.J, self.W, self.t_scale, self.ODE_params, self.edges, self.chunk_lengths, self.num_chunks, 
+                                                               self.n_per_chunk, self.causal_weight)
         else:
             #Calculate losses
             residual_loss, terms1 = residual_viv_loss(self.model, self.device, self.dtype, self.t_min, self.t_max, self.t_scale, 
@@ -489,6 +593,8 @@ class ODETrainingStepper:
 
         #Logs if it is time for it
         if (self.steps % self.log_every_n_steps) == 0:
+            val_dirac = self._validate_dirac()
+            grad_norm_val = float(total_grad_norm.detach().cpu()) if torch.is_tensor(total_grad_norm) else float(total_grad_norm)
             # Log causal weights per chunk (detached floats)
             wi = terms1.get('wi') if isinstance(terms1, dict) else None
             if wi is not None:
@@ -520,9 +626,9 @@ class ODETrainingStepper:
                     self.writer.add_scalar('causal/sum_w', float(sum(float(x) for x in wi)), self.steps)
                 except Exception:
                     pass
-
             self._log({'total': loss.item(), 'res': residual_loss.item(), 'ic': ic_loss.item(), 'bc': bc_loss.item()},
-                      total_grad_norm.item())
+                      val_dirac=val_dirac,
+                      grad_norm_mean=grad_norm_val)
 
     def log_yq_curves(self,
                       steps: int = 512,
