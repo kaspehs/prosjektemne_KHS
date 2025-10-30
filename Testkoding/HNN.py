@@ -49,6 +49,8 @@ def main():
         raise ValueError("rollout_len is longer than available data; reduce rollout_len.")
     force_reg_coeff = 1e-4
     use_force_reg = True
+    force_smooth_coeff = 1e-6
+    use_force_smooth = True
     grad_norm_max = 1e4
 
     # estimate initial velocity from data (only once)
@@ -76,10 +78,16 @@ def main():
 
         preds = []
         force_accum = torch.tensor(0.0, device=device, dtype=y_data_t.dtype)
+        force_series: list[torch.Tensor] = []
+        collect_forces = ((use_force_reg and force_reg_coeff > 0.0) or
+                          (use_force_smooth and force_smooth_coeff > 0.0))
         for _ in range(rollout_len):
-            if use_force_reg and force_reg_coeff > 0.0:
+            if collect_forces:
                 forces = model.u_theta(state)
-                force_accum = force_accum + (forces.squeeze(-1) ** 2).mean()
+                if use_force_reg and force_reg_coeff > 0.0:
+                    force_accum = force_accum + (forces.squeeze(-1) ** 2).mean()
+                if use_force_smooth and force_smooth_coeff > 0.0:
+                    force_series.append(forces)
             preds.append(state[:, 0])
             state = model.step_rk4(state, dt)
 
@@ -88,11 +96,18 @@ def main():
 
         data_mse = nn.MSELoss()(y_pred, y_true)
         loss = data_mse
+        reg = None
         if use_force_reg and force_reg_coeff > 0.0:
             reg = force_accum / rollout_len
             loss = loss + force_reg_coeff * reg
-        else:
-            reg = None
+
+        smooth_reg = None
+        if (use_force_smooth and force_smooth_coeff > 0.0
+                and collect_forces and len(force_series) > 1):
+            forces_tensor = torch.cat(force_series, dim=1)  # (batch, rollout_len)
+            force_diff = forces_tensor[:, 1:] - forces_tensor[:, :-1]
+            smooth_reg = (force_diff ** 2).mean()
+            loss = loss + force_smooth_coeff * smooth_reg
 
         loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_norm_max)
@@ -103,7 +118,9 @@ def main():
         writer.add_scalar("train/damping_ratio", float(torch.sigmoid(model.zeta_raw).detach().cpu()), step)
         writer.add_scalar("train/grad_norm", float(grad_norm.detach().cpu()), step)
         if reg is not None:
-            writer.add_scalar("train/force_reg", float(reg.detach().cpu())*force_reg_coeff, step)
+            writer.add_scalar("train/force_reg", float((reg * force_reg_coeff).detach().cpu()), step)
+        if smooth_reg is not None:
+            writer.add_scalar("train/force_smooth_reg", float((smooth_reg * force_smooth_coeff).detach().cpu()), step)
 
         if (step + 1) % eval_every == 0:
             v0_eval = vel[0]
