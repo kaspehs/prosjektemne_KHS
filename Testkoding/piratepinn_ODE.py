@@ -23,6 +23,10 @@ torch.set_default_dtype(dtype)
 torch.set_num_threads(1)
 torch.set_num_interop_threads(1)
 
+data = np.load('data.npz')
+time = data['a']
+y = data['b']
+
 #Dataset parameters
 t_points = 200 #Dimentions of dataset
 input_size = 1   # number of features in your data
@@ -35,7 +39,11 @@ Q_PLOT_LIMIT = 2.0
 # Load shared ODE configuration
 ode_setup = build_ode_setup()
 cfg = ode_setup["config"]
-ODE_params = ode_setup["ode_params"]
+ODE_params = TrainableODEParams(
+    ode_setup["ode_params"],
+    dtype=dtype,
+    device=device,
+)
 u_ic = ode_setup["u_ic"]
 T_MIN_CONST = ode_setup["T_MIN_CONST"]
 T_MAX_CONST = ode_setup["T_MAX_CONST"]
@@ -45,15 +53,15 @@ print_ode_summary(ode_setup)
 LOG_RUN_NAME = None  # e.g., "pinn_exp1"; None uses timestamped default
 
 #Architechture parameters
-num_blocks = 3 #Depth of networks
+num_blocks = 2 #Depth of networks
 hidden_size = 64  # number of hidden units
-fourier_features = 128
+fourier_features = 64
 sigma = 32.0
 # Sine embedding for PirateNet's U-branch
 USE_SINE_EMBED = False
 W0_EMBED = 5.0
-num_chunks = 64 #Time chunks for causal training
-n_per_chunk = 8
+num_chunks = 32 #Time chunks for causal training
+n_per_chunk = 16
 chunk_dirichlet_alpha = 3.0  # Dirichlet concentration for random chunk lengths
 chunk_length_min_frac = 0.3  # Minimum chunk length relative to uniform average
 chunk_length_max_frac = 3  # Maximum chunk length relative to uniform average
@@ -64,17 +72,20 @@ factorize_output=False
 #Optimization parameters
 total_steps = int(2e5)
 grad_clip_max_norm = 1e5  # gradient clipping threshold (L2 norm)
-causal_weight = 1.0
+causal_weight = 0.9
 lambda_freq = 1000
 grad_norm_alpha = 0.9
 # GradNorm clamp limits (min/max lambda); configurable
-LAMBDA_MIN = 0.2
-LAMBDA_MAX = 5.0
+LAMBDA_MIN = 0.3
+LAMBDA_MAX = 3.0
+DATA_LOSS_WEIGHT = 100.0
+DATA_BATCH_SIZE = 1028  # 0 or None uses full dataset each step
+USE_IC_LOSS = False
 
 #Learning rate parameters
 base_lr = 1e-3
 decay_rate = 0.9
-decay_steps = 2000
+decay_steps = 3000
 warmup_steps = 5000
 
 #Logging parameters
@@ -104,6 +115,23 @@ def main():
                       w0_embed=W0_EMBED).to(device=device, dtype=dtype)
 
     t_scale = torch.tensor(T_range/2.0,  dtype=dtype, device=device)
+    denom = float(max(T_range, 1e-12))
+    t_min_phys = torch.tensor(float(T_MIN_CONST), dtype=dtype, device=device)
+    t_max_phys = torch.tensor(float(T_MAX_CONST), dtype=dtype, device=device)
+    time_tensor = torch.as_tensor(time, dtype=dtype, device=device)
+    y_tensor = torch.as_tensor(y, dtype=dtype, device=device)
+    mask = (time_tensor >= t_min_phys) & (time_tensor <= t_max_phys)
+    if not torch.any(mask):
+        raise ValueError("No observational samples fall within the residual training window.")
+    if not torch.all(mask):
+        kept = int(mask.sum().item())
+        total = int(mask.numel())
+        print(f"Clipping observational data to training window: keeping {kept}/{total} samples.")
+        time_tensor = time_tensor[mask]
+        y_tensor = y_tensor[mask]
+    time_std = 2.0 * (time_tensor - t_min_phys) / denom - 1.0
+    data_t = time_std.reshape(-1, 1)
+    data_y = y_tensor.reshape(-1, 1)
 
     # TensorBoard writer
     import os as _os, time as _time
@@ -124,7 +152,10 @@ def main():
     print("||theta||_2:", stats["theta_l2"].cpu().numpy())
     """
     # Stepper-based training like pinn.py
-    optimizer = optim.Adam(model.parameters(), lr=base_lr)
+    optimizer = optim.Adam(
+        list(model.parameters()) + list(ODE_params.parameters()),
+        lr=base_lr,
+    )
     lr_scheduler = LrSchedule(base_lr, decay_rate, warmup_steps, decay_steps)
     stepper = ODETrainingStepper(model, t_min, t_max, u_ic,
                               ODE_params,
@@ -139,7 +170,12 @@ def main():
                               dirac_val_points=dirac_val_points,
                               diameter=D,
                               y_plot_limit=Y_PLOT_LIMIT, q_plot_limit=Q_PLOT_LIMIT, 
-                              vPINN = True)
+                              vPINN = True,
+                              data_t=data_t,
+                              data_y=data_y,
+                              data_weight=DATA_LOSS_WEIGHT,
+                              data_batch_size=DATA_BATCH_SIZE,
+                              use_ic_loss=USE_IC_LOSS)
     
     # Apply GradNorm clamp limits from config
     try:

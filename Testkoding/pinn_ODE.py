@@ -35,7 +35,11 @@ Q_PLOT_LIMIT = 2.0
 # Load shared ODE configuration
 ode_setup = build_ode_setup()
 cfg = ode_setup["config"]
-ODE_params = ode_setup["ode_params"]
+ODE_params = TrainableODEParams(
+    ode_setup["ode_params"],
+    dtype=dtype,
+    device=device,
+)
 u_ic = ode_setup["u_ic"]
 T_MIN_CONST = ode_setup["T_MIN_CONST"]
 T_MAX_CONST = ode_setup["T_MAX_CONST"]
@@ -107,7 +111,10 @@ def main():
             dtype=dtype,
         ).to(device=device, dtype=dtype)
 
-    optimizer = optim.Adam(model.parameters(), lr=base_lr)
+    optimizer = optim.Adam(
+        list(model.parameters()) + list(ODE_params.parameters()),
+        lr=base_lr,
+    )
     lr_scheduler = LrSchedule(base_lr, decay_rate, warmup_steps, decay_steps)
 
     import time as _time

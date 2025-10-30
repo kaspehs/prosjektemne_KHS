@@ -35,7 +35,7 @@ class ODEConfig:
 
     # Time span in physical coordinates
     T_min: float = 0.0
-    T_max: float = 20.0
+    T_max: float = 10.0
 
 
 def build_ode_setup(config: ODEConfig | None = None) -> Dict[str, Any]:

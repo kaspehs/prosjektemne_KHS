@@ -88,7 +88,12 @@ for i in range(N-1):
 # ddy = ddy[:15000]
 # time = time[:15000]
 
+print(time)
+print(y)
 
+np.savez("data.npz", a = time, b = y)
+
+'''
 fig = plt.figure(figsize=(7,4))
 plt.plot(time, Fy, label='Force (N)')
 plt.plot(time, y*100, label=r'Displacement $\times 10^2$ (m)')
@@ -179,3 +184,5 @@ plt.plot(theta_data, fhat_data, '-k')
 plt.ylabel('Normalized frequency fhat')
 plt.xlabel(r'CF phase $\theta$ btw cylinder velocity and vortex shedding force Fcv')
 plt.show()
+
+'''

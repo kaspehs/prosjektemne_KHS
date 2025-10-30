@@ -1,7 +1,145 @@
 import torch
 import numpy as np
+from collections.abc import Iterable, Mapping
+from itertools import chain
 from torch import nn, autograd
+import torch.nn.functional as F
 from helper_functions import figure_compare_data
+
+
+class TrainableODEParams(nn.Module):
+    """
+    Wraps scalar ODE coefficients inside an nn.Module so we can optimise them
+    alongside the network. By default only the dynamical coefficients are
+    promoted to parameters while scale factors stay frozen as buffers.
+    """
+
+    DEFAULT_TRAINABLE = (
+        "my",
+        "cy",
+        "ky",
+        "k3y",
+        "Kl",
+        "cq",
+        "kq",
+        "Kc",
+    )
+
+    def __init__(
+        self,
+        values: Mapping[str, float | torch.Tensor],
+        *,
+        trainable_keys: Iterable[str] | bool | None = DEFAULT_TRAINABLE,
+        positive_keys: Iterable[str] | bool | None = DEFAULT_TRAINABLE,
+        softplus_eps: float = 1e-6,
+        dtype: torch.dtype | None = None,
+        device: torch.device | None = None,
+    ) -> None:
+        super().__init__()
+        if dtype is None:
+            dtype = torch.get_default_dtype()
+        if device is None:
+            device = torch.device("cpu")
+
+        if trainable_keys is True or trainable_keys is None:
+            trainable_set = set(values.keys())
+        elif trainable_keys is False:
+            trainable_set = set()
+        else:
+            trainable_set = set(trainable_keys)
+
+        if positive_keys is True or positive_keys is None:
+            positive_set = set(values.keys())
+        elif positive_keys is False:
+            positive_set = set()
+        else:
+            positive_set = set(positive_keys)
+
+        self._positive_keys: set[str] = set()
+        self._trainable_names: set[str] = set()
+        self._value_names: list[str] = []
+        self._softplus_eps = float(softplus_eps)
+
+        for name, raw_value in values.items():
+            tensor = torch.as_tensor(raw_value, dtype=dtype, device=device)
+            target = tensor.clone().detach()
+            if name in trainable_set:
+                if name in positive_set:
+                    # ensure strictly positive initial value
+                    init = target.clamp_min(self._softplus_eps)
+                    raw = self._softplus_inverse(init)
+                    self.register_parameter(name, nn.Parameter(raw))
+                    self._positive_keys.add(name)
+                else:
+                    self.register_parameter(name, nn.Parameter(target))
+                self._trainable_names.add(name)
+            else:
+                self.register_buffer(name, target)
+            self._value_names.append(name)
+
+    def __getitem__(self, key: str) -> torch.Tensor:
+        value = getattr(self, key)
+        if isinstance(value, nn.Parameter):
+            if key in self._positive_keys:
+                return F.softplus(value) + self._softplus_eps
+            return value
+        return value
+
+    def keys(self):
+        return tuple(self._value_names)
+
+    def items(self):
+        return ((k, self[k]) for k in self.keys())
+
+    @property
+    def trainable_names(self) -> tuple[str, ...]:
+        return tuple(self._trainable_names)
+
+    @property
+    def buffer_names(self) -> tuple[str, ...]:
+        return tuple(name for name in self._value_names if name not in self._trainable_names)
+
+    def to_dict(self, detach: bool = True) -> dict[str, torch.Tensor]:
+        out = {}
+        for k in self.keys():
+            tensor: torch.Tensor
+            if k in self._trainable_names:
+                tensor = self[k]
+            else:
+                tensor = getattr(self, k)
+            out[k] = tensor.detach().clone() if detach else tensor
+        return out
+
+    @staticmethod
+    def _softplus_inverse(y: torch.Tensor) -> torch.Tensor:
+        """Stable inverse softplus."""
+        threshold = y.new_tensor(20.0)
+        large = y > threshold
+        small_vals = torch.log(torch.expm1(y))
+        large_vals = y + torch.log1p(-torch.exp(-y))
+        return torch.where(large, large_vals, small_vals)
+
+
+def _ode_param(params, name: str, *, device=None, dtype=None) -> torch.Tensor:
+    """
+    Fetch parameter `name` from either a TrainableODEParams module or a plain dict.
+    Dict values are converted to tensors on the requested device/dtype.
+    """
+    if isinstance(params, TrainableODEParams):
+        tensor = params[name]
+        if device is not None and tensor.device != device:
+            tensor = tensor.to(device=device)
+        if dtype is not None and tensor.dtype != dtype:
+            tensor = tensor.to(dtype=dtype)
+        return tensor
+    value = params[name]
+    if isinstance(value, torch.Tensor):
+        return value.to(device=device, dtype=dtype) if (
+            device is not None and value.device != device or
+            dtype is not None and value.dtype != dtype
+        ) else value
+    return torch.as_tensor(value, device=device, dtype=dtype)
+
 
 def d(outputs, inputs, retain_graph=True, create_graph=True):
     """First derivative helper that is safe for higher-order calls.
@@ -68,16 +206,16 @@ def residual_viv_loss(model, device, dtype,
     qtt = q_tt_hat / (t_scale ** 2)
 
     #Unpacking ODE parameters for cleaner, more visual code
-    my = ODE_params['my']
-    cy = ODE_params['cy']
-    ky = ODE_params['ky']
-    k3y = ODE_params['k3y']
-    Kl = ODE_params['Kl']
-    cq = ODE_params['cq']
-    kq = ODE_params['kq']
-    Kc = ODE_params['Kc']
-    y_scale = ODE_params['y_scale']
-    q_scale = ODE_params['q_scale']
+    my = _ode_param(ODE_params, 'my', device=device, dtype=dtype)
+    cy = _ode_param(ODE_params, 'cy', device=device, dtype=dtype)
+    ky = _ode_param(ODE_params, 'ky', device=device, dtype=dtype)
+    k3y = _ode_param(ODE_params, 'k3y', device=device, dtype=dtype)
+    Kl = _ode_param(ODE_params, 'Kl', device=device, dtype=dtype)
+    cq = _ode_param(ODE_params, 'cq', device=device, dtype=dtype)
+    kq = _ode_param(ODE_params, 'kq', device=device, dtype=dtype)
+    Kc = _ode_param(ODE_params, 'Kc', device=device, dtype=dtype)
+    y_scale = _ode_param(ODE_params, 'y_scale', device=device, dtype=dtype)
+    q_scale = _ode_param(ODE_params, 'q_scale', device=device, dtype=dtype)
 
 
     y_res = my * ytt + cy * yt + ky * y + k3y * y**3 - Kl * q
@@ -159,10 +297,16 @@ def residual_viv_weak_loss(model, device, dtype,
         dphi_dt_e = dphi_dt.unsqueeze(-1)         # (n_chunks, n_qp, 1)
 
         # unpack ODE params (your dict)
-        my  = ODE_params['my'];  cy  = ODE_params['cy'];  ky  = ODE_params['ky']
-        k3y = ODE_params['k3y']; Kl  = ODE_params['Kl']
-        cq  = ODE_params['cq'];  kq  = ODE_params['kq'];  Kc  = ODE_params['Kc']
-        y_scale = ODE_params['y_scale']; q_scale = ODE_params['q_scale']
+        my  = _ode_param(ODE_params, 'my', device=device, dtype=dtype)
+        cy  = _ode_param(ODE_params, 'cy', device=device, dtype=dtype)
+        ky  = _ode_param(ODE_params, 'ky', device=device, dtype=dtype)
+        k3y = _ode_param(ODE_params, 'k3y', device=device, dtype=dtype)
+        Kl  = _ode_param(ODE_params, 'Kl', device=device, dtype=dtype)
+        cq  = _ode_param(ODE_params, 'cq', device=device, dtype=dtype)
+        kq  = _ode_param(ODE_params, 'kq', device=device, dtype=dtype)
+        Kc  = _ode_param(ODE_params, 'Kc', device=device, dtype=dtype)
+        y_scale = _ode_param(ODE_params, 'y_scale', device=device, dtype=dtype)
+        q_scale = _ode_param(ODE_params, 'q_scale', device=device, dtype=dtype)
 
         # weak integrands (no second derivatives)
         integrand_y = (-my * dphi_dt_e * yt_qp
@@ -368,10 +512,14 @@ class ODETrainingStepper:
                 diameter: float = 1.0,
                 y_plot_limit: float = 1.0,
                 q_plot_limit: float = 1.0, 
-                vPINN = False): #Logging spesific parameters
+                vPINN: bool = False,
+                data_t: torch.Tensor | np.ndarray | None = None,
+                data_y: torch.Tensor | np.ndarray | None = None,
+                data_weight: float = 1.0,
+                data_batch_size: int | None = None,
+                use_ic_loss: bool = True): #Logging spesific parameters
         self.model = model
         self.t_min = t_min; self.t_max = t_max; self.t_scale = t_scale; self.u_ic = u_ic
-        self.ODE_params = ODE_params
         self.optimizer = optimizer; self.grad_clip_max_norm = grad_clip_max_norm
         self.n_per_chunk = n_per_chunk; self.num_chunks = num_chunks
         self.causal_weight = causal_weight; self.lamda_freq = lambda_freq
@@ -385,9 +533,16 @@ class ODETrainingStepper:
         self.y_plot_limit = float(y_plot_limit) if y_plot_limit > 0 else 1.0
         self.q_plot_limit = float(q_plot_limit) if q_plot_limit > 0 else 1.0
         self.vPINN = vPINN
+        self.use_ic_loss = bool(use_ic_loss)
 
         self.device = next(model.parameters()).device
         self.dtype = next(model.parameters()).dtype
+        if isinstance(ODE_params, TrainableODEParams):
+            self.ODE_params = ODE_params.to(device=self.device, dtype=self.dtype)
+            self._extra_params = [p for p in self.ODE_params.parameters() if p.requires_grad]
+        else:
+            self.ODE_params = ODE_params
+            self._extra_params = []
         self.val_dirac_t = None
         if self.dirac_val_points > 0:
             if isinstance(self.t_min, torch.Tensor):
@@ -407,8 +562,27 @@ class ODETrainingStepper:
             ).view(-1, 1)
 
         self.steps = 0
-        self.lam = {'ic': 1.0, 'res': 1.0}
-        self.balancer = GradNormBalancer(self.model, self.lam.keys(), alpha = self.alpha)
+        self.data_t = None
+        self.data_y = None
+        self.data_weight = float(data_weight)
+        self.has_data = data_t is not None and data_y is not None
+        self.data_batch_size = int(data_batch_size) if data_batch_size else None
+        self._data_count = 0
+        if self.has_data:
+            self._set_observations(data_t, data_y)
+
+        self.lam = {'res': 1.0}
+        if self.use_ic_loss:
+            self.lam['ic'] = 1.0
+        if self.has_data:
+            self.lam['data'] = 1.0
+        self.balancer = GradNormBalancer(
+            self.model,
+            tuple(self.lam.keys()),
+            alpha=self.alpha,
+            extra_params=self._extra_params,
+            device=self.device,
+        )
 
         self.lr = 0.0
         self.chunk_lengths = None
@@ -419,6 +593,14 @@ class ODETrainingStepper:
             xi_np, w_np = np.polynomial.legendre.leggauss(n_per_chunk)
             self.xi = torch.tensor(xi_np, device=self.device, dtype=self.dtype)
             self.w  = torch.tensor(w_np,  device=self.device, dtype=self.dtype)
+
+    def _set_observations(self, t_obs, y_obs):
+        t_tensor = torch.as_tensor(t_obs, dtype=self.dtype, device=self.device).reshape(-1, 1)
+        y_tensor = torch.as_tensor(y_obs, dtype=self.dtype, device=self.device).reshape(-1, 1)
+        self.data_t = t_tensor
+        self.data_y = y_tensor
+        self.has_data = True
+        self._data_count = int(t_tensor.shape[0])
 
     def define_validation_data(self, xb, yb):
         self.xb = xb; self.yb = yb
@@ -454,16 +636,16 @@ class ODETrainingStepper:
                 qtt = q_tt_hat / (t_scale ** 2)
 
                 params = self.ODE_params
-                my = float(params["my"])
-                cy = float(params["cy"])
-                ky = float(params["ky"])
-                k3y = float(params["k3y"])
-                Kl = float(params["Kl"])
-                cq = float(params["cq"])
-                kq = float(params["kq"])
-                Kc = float(params["Kc"])
-                y_scale = float(params["y_scale"])
-                q_scale = float(params["q_scale"])
+                my = _ode_param(params, "my", device=self.device, dtype=self.dtype)
+                cy = _ode_param(params, "cy", device=self.device, dtype=self.dtype)
+                ky = _ode_param(params, "ky", device=self.device, dtype=self.dtype)
+                k3y = _ode_param(params, "k3y", device=self.device, dtype=self.dtype)
+                Kl = _ode_param(params, "Kl", device=self.device, dtype=self.dtype)
+                cq = _ode_param(params, "cq", device=self.device, dtype=self.dtype)
+                kq = _ode_param(params, "kq", device=self.device, dtype=self.dtype)
+                Kc = _ode_param(params, "Kc", device=self.device, dtype=self.dtype)
+                y_scale = _ode_param(params, "y_scale", device=self.device, dtype=self.dtype)
+                q_scale = _ode_param(params, "q_scale", device=self.device, dtype=self.dtype)
 
                 y_res = my * ytt + cy * yt + ky * y + k3y * y**3 - Kl * q
                 q_res = qtt + cq * (q**2 - 1.0) * qt + kq * q - Kc * ytt
@@ -489,12 +671,16 @@ class ODETrainingStepper:
                       train: dict,
                       #val_data_loss: float,
                       val_dirac: dict | None = None,
-                      grad_norm_mean: float | None = None):
+                      grad_norm_mean: float | None = None,
+                      data_terms: dict | None = None):
         self.writer.add_scalar('train/lr', self.lr, self.steps)
         self.writer.add_scalar('train/loss_total', train.get('total', float('nan')), self.steps)
         self.writer.add_scalar('train/loss_residual', train.get('res', float('nan')), self.steps)
-        self.writer.add_scalar('train/loss_ic', train.get('ic', float('nan')), self.steps)
+        if 'ic' in train:
+            self.writer.add_scalar('train/loss_ic', train.get('ic', float('nan')), self.steps)
         self.writer.add_scalar('train/loss_bc', train.get('bc', float('nan')), self.steps)
+        if 'data' in train:
+            self.writer.add_scalar('train/loss_data', train.get('data', float('nan')), self.steps)
         #self.writer.add_scalar('val/data_loss', val_data_loss, self.steps)
 
         if val_dirac is not None:
@@ -505,6 +691,10 @@ class ODETrainingStepper:
 
         if grad_norm_mean is not None:
             self.writer.add_scalar('train/grad_total_norm_mean', grad_norm_mean, self.steps)
+
+        if data_terms is not None:
+            for k, v in data_terms.items():
+                self.writer.add_scalar(f'data/{k}', float(v), self.steps)
 
         # Log current lambda weights for losses (res, bc, ic)
         try:
@@ -528,11 +718,32 @@ class ODETrainingStepper:
         except Exception:
             pass
 
-        msg = (
-            f"Epoch {self.steps+1:02d} "
-            f"train(total={train.get('total', float('nan')):.3e}, res={train.get('res', float('nan')):.3e}, bc={train.get('bc', float('nan')):.3e}), "
-            f"ic={train.get('ic', float('nan')):.3e}"
-        )
+        # Log ODE coefficients and scales if they are modules/buffers
+        try:
+            if isinstance(self.ODE_params, TrainableODEParams):
+                for name in self.ODE_params.trainable_names:
+                    val = self.ODE_params[name]
+                    self.writer.add_scalar(f'ode/param/{name}', float(val.detach().cpu()), self.steps)
+                for name in self.ODE_params.buffer_names:
+                    val = self.ODE_params[name]
+                    self.writer.add_scalar(f'ode/buffer/{name}', float(val.detach().cpu()), self.steps)
+            elif isinstance(self.ODE_params, dict):
+                for name, value in self.ODE_params.items():
+                    tensor = torch.as_tensor(value, device=self.device, dtype=self.dtype)
+                    self.writer.add_scalar(f'ode/value/{name}', float(tensor.detach().cpu()), self.steps)
+        except Exception:
+            pass
+
+        train_parts = [
+            f"total={train.get('total', float('nan')):.3e}",
+            f"res={train.get('res', float('nan')):.3e}",
+            f"bc={train.get('bc', float('nan')):.3e}",
+        ]
+        if 'ic' in train:
+            train_parts.append(f"ic={train.get('ic', float('nan')):.3e}")
+        if 'data' in train:
+            train_parts.append(f"data={train.get('data', float('nan')):.3e}")
+        msg = f"Epoch {self.steps+1:02d} train(" + ", ".join(train_parts) + ")"
         if val_dirac is not None:
             msg += (
                 f", val_dirac(total={val_dirac.get('total', float('nan')):.3e}, "
@@ -573,22 +784,60 @@ class ODETrainingStepper:
                                                     self.ODE_params,
                                                     self.num_chunks, self.n_per_chunk, self.causal_weight)
         #bc_loss, terms2 = periodic_bc_loss(self.model, t_bc, self.x0, self.L)
-        bc_loss, terms2 = torch.tensor(0.0), None
-        ic_loss, terms3 = init_condition_loss(self.model, self.u_ic, self.t_min, self.t_scale)
+        bc_loss, terms2 = torch.tensor(0.0, device=self.device, dtype=self.dtype), None
+        if self.use_ic_loss:
+            ic_loss, terms3 = init_condition_loss(self.model, self.u_ic, self.t_min, self.t_scale)
+        else:
+            ic_loss = torch.zeros((), device=self.device, dtype=self.dtype)
+            terms3 = None
+        data_loss = None
+        data_terms = None
+        if self.has_data and self.data_t is not None and self.data_y is not None:
+            if self.data_batch_size is not None and self.data_batch_size > 0 and self._data_count > self.data_batch_size:
+                batch_size = min(self.data_batch_size, self._data_count)
+                idx = torch.randint(0, self._data_count, (batch_size,), device=self.device)
+                t_batch = self.data_t[idx]
+                y_batch = self.data_y[idx]
+            else:
+                t_batch = self.data_t
+                y_batch = self.data_y
+            preds = self.model(t_batch)
+            y_pred = preds[:, 0:1]
+            diff = y_pred - y_batch
+            mse = (diff ** 2).mean()
+            data_loss = mse
+            data_terms = {
+                "mse": float(mse.detach().cpu()),
+                "rmse": float(torch.sqrt(mse + 1e-12).detach().cpu()),
+                "max_abs": float(diff.abs().max().detach().cpu()),
+                "scaled": float(data_loss.detach().cpu()),
+            }
+            if self.data_batch_size is not None and self.data_batch_size > 0:
+                data_terms["batch_size"] = int(t_batch.shape[0])
         # Freeze λ weights wrt θ
         lam_res = self.lam['res'].detach() if torch.is_tensor(self.lam['res']) else torch.tensor(float(self.lam['res']), device=self.device)
-        lam_ic  = self.lam['ic' ].detach() if torch.is_tensor(self.lam['ic' ]) else torch.tensor(float(self.lam['ic' ]), device=self.device)
-        loss = residual_loss * lam_res + ic_loss * lam_ic
+        loss = residual_loss * lam_res
+        if self.use_ic_loss:
+            lam_ic = self.lam['ic'].detach() if torch.is_tensor(self.lam['ic']) else torch.tensor(float(self.lam['ic']), device=self.device)
+            loss = loss + ic_loss * lam_ic
+        if data_loss is not None and 'data' in self.lam:
+            lam_data = self.lam['data'].detach() if torch.is_tensor(self.lam['data']) else torch.tensor(float(self.lam['data']), device=self.device)
+            loss = loss + data_loss * lam_data * self.data_weight
         
         #Updates loss weighting every lambda_freq steps
         if (self.steps % self.lamda_freq) == 0:
-            #self.lam = self.balancer.update({'ic':ic_loss, 'bc': bc_loss, 'res': residual_loss})
-            self.lam = self.balancer.update({'ic':ic_loss, 'res': residual_loss})
+            losses_for_balancer = {'ic': ic_loss, 'res': residual_loss}
+            if 'data' in self.lam:
+                losses_for_balancer['data'] = data_loss if data_loss is not None else torch.tensor(0.0, device=self.device)
+            self.lam = self.balancer.update(losses_for_balancer)
 
         #Backpropagation
         self.optimizer.zero_grad(set_to_none=True)
         loss.backward()
-        total_grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_max_norm)
+        clip_params = [p for p in self.model.parameters() if p.requires_grad]
+        if self._extra_params:
+            clip_params.extend(self._extra_params)
+        total_grad_norm = torch.nn.utils.clip_grad_norm_(clip_params, self.grad_clip_max_norm)
         self.optimizer.step()
 
         #Logs if it is time for it
@@ -626,9 +875,15 @@ class ODETrainingStepper:
                     self.writer.add_scalar('causal/sum_w', float(sum(float(x) for x in wi)), self.steps)
                 except Exception:
                     pass
-            self._log({'total': loss.item(), 'res': residual_loss.item(), 'ic': ic_loss.item(), 'bc': bc_loss.item()},
+            train_log = {'total': loss.item(), 'res': residual_loss.item(), 'bc': bc_loss.item()}
+            if self.use_ic_loss:
+                train_log['ic'] = ic_loss.item()
+            if data_loss is not None:
+                train_log['data'] = data_loss.item()
+            self._log(train_log,
                       val_dirac=val_dirac,
-                      grad_norm_mean=grad_norm_val)
+                      grad_norm_mean=grad_norm_val,
+                      data_terms=data_terms)
 
     def log_yq_curves(self,
                       steps: int = 512,
@@ -698,7 +953,7 @@ class GradNormBalancer:
     Maintains global weights for multiple loss terms based on gradient norms.
     Updates every `freq` steps using EMA with coefficient `alpha`.
     """
-    def __init__(self, model: nn.Module, names=("ic","bc","res"), alpha=0.9, eps=1e-8, device=None):
+    def __init__(self, model: nn.Module, names=("ic","bc","res"), alpha=0.9, eps=1e-8, device=None, extra_params=None):
         self.model  = model
         self.names  = tuple(names)
         self.alpha  = alpha
@@ -706,6 +961,9 @@ class GradNormBalancer:
         self.w_min  = 0.1
         self.w_max  = 10
         self.device = device or next(model.parameters()).device
+        if extra_params is None:
+            extra_params = ()
+        self.extra_params = tuple(p for p in extra_params if p.requires_grad)
 
         # EMA of grad norms; init to 1 for neutrality
         self.g_ema  = {n: torch.tensor(1.0, device=self.device) for n in self.names}
@@ -714,7 +972,9 @@ class GradNormBalancer:
         self.step   = 0
     
     def _global_grad_norm(self, loss):
-        params = [p for p in self.model.parameters() if p.requires_grad]
+        params = [p for p in chain(self.model.parameters(), self.extra_params) if p.requires_grad]
+        if not params:
+            return torch.tensor(0.0, device=self.device)
         grads  = torch.autograd.grad(loss, params, retain_graph=True,
                                      create_graph=False, allow_unused=True)
         sq = None
