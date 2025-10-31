@@ -75,6 +75,12 @@ for i in range(N-1):
     y[i+1] = y[i] + dt*dy[i]
     dy[i+1] = dy[i] + dt*ddy[i] # dt/M*(-C*dy[i]-K*y[i]+Fy[i])
     ddy[i+1] = 1/M*(-C*dy[i+1]-K*y[i+1]+Fy[i+1])
+
+time = time[:-1]
+y = y[:-1]
+dy = dy[:-1]
+ddy = ddy[:-1]
+Fy = Fy[:-1]
 #Fy[1]=[]
 
 # # take the 100 last T
@@ -93,7 +99,7 @@ print(y)
 
 np.savez("data.npz", a = time, b = y)
 
-'''
+
 fig = plt.figure(figsize=(7,4))
 plt.plot(time, Fy, label='Force (N)')
 plt.plot(time, y*100, label=r'Displacement $\times 10^2$ (m)')
@@ -103,7 +109,7 @@ plt.ylabel('Simulation')
 plt.xlabel('time (sec)')
 plt.legend()
 plt.show()
-
+'''
 fig = plt.figure(figsize=(7,4))
 plt.plot(time, y, label=r'Displacement (m)')
 # plt.xlim([12, 14])

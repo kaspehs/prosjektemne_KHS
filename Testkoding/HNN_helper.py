@@ -11,13 +11,14 @@ class PHVIV(nn.Module):
     State x = [y, v].
     dot x = (J - R(x)) ∇H(x) + G u_theta(x)
     """
-    def __init__(self, m=16.79, k=1218.0, U = 0.65, rho=1000.0, D=0.1):
+    def __init__(self, m=16.79, k=1218.0, U = 0.65, rho=1000.0, D=0.1, max_damping_ratio = 0.2):
         super().__init__()
         self.m = m
         self.k = k
         self.U = U
         self.rho = rho
         self.D = D
+        self.max_damping_ratio = max_damping_ratio
 
         # NN for instantaneous force u(x)
         self.u_net = nn.Sequential(
@@ -51,7 +52,7 @@ class PHVIV(nn.Module):
 
     def R(self, x):
 
-        zeta = torch.sigmoid(self.zeta_raw)
+        zeta = torch.sigmoid(self.zeta_raw)*self.max_damping_ratio
         R = torch.zeros(*x.shape[:-1], 2, 2, device=x.device, dtype=x.dtype)
         R[..., 1, 1] = 2*zeta*torch.sqrt(torch.tensor(self.k*self.m))/self.m**2
         return R
@@ -70,11 +71,14 @@ class PHVIV(nn.Module):
         return Fd.unsqueeze(-1)
 
 
-    def u_theta(self, x):
+    def u_theta1(self, x):
         return self.u_net(x)
     
     def u_theta2(self, x):
         return self.u_net(x) + self.drag_force(x)
+    
+    def u_theta(self, x):
+        return self.u_theta2(x)
 
     def f(self, x):
         gH = self.grad_H(x)                         # (..., 2)
@@ -88,7 +92,7 @@ class PHVIV(nn.Module):
 
         core = JgH - RgH
 
-        u = self.u_theta2(x)                         # (..., 1)
+        u = self.u_theta(x)                         # (..., 1)
         Gu = torch.einsum('ij,...j->...i', G, u)    # (..., 2)
 
         return core + Gu
@@ -102,3 +106,17 @@ class PHVIV(nn.Module):
         k3 = self.f(x + 0.5 * dt * k2)
         k4 = self.f(x + dt * k3)
         return x + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+
+def rollout_len_schedule(epoch, characteristic_epoch):
+    if epoch < 1*characteristic_epoch:
+        return 32
+    elif epoch < 2*characteristic_epoch:
+        return 64
+    elif epoch < 3*characteristic_epoch:
+        return 128
+    elif epoch < 4*characteristic_epoch:
+        return 256
+    elif epoch < 5*characteristic_epoch:
+        return 400
+    else:
+        return 600
