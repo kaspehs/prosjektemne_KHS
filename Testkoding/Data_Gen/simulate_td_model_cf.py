@@ -10,11 +10,13 @@ from utils import vforce_CF
 
 # Case input
 M = 16.79           # mass kg
-C = 1.0e-4            # structural damping
+zeta = 0.01             # structural damping
 K = 1218            # stiffness N/m
 rho = 1000        # fluid density (kg/m3)
 U = 0.65           # flow speed (m/s)
-D = 0.1          # diameter of the cylinder (m)
+D = 0.1      # diameter of the cylinder (m)
+C = 2*zeta*np.sqrt(M*K)
+print(C)
 nsteps = 200     # number of timesteps per cycle
 n_memory = 500   # number of timesteps for calculation of instantaneous velocity
 
@@ -30,7 +32,7 @@ fhat_max = 0.206 # higher normalized frequency limit
 
 # 
 dt = 0.001                # time step
-T = 50                  # 
+T = 20                  # 
 N = int(np.ceil(T/dt))
 
 U_r = 2*np.pi * U / D * np.sqrt((M + D**2*np.pi/4*rho)/K)
@@ -56,12 +58,14 @@ mean_ddy_loc = np.zeros(N)
 
 # Initial conditions:
 A = 1.0*D
-fhat = 0.17
+fhat = 0.001
 omega_osc = 2*np.pi*fhat*U/D
 Tosc = 2*np.pi/omega_osc
 y[0] = A*np.sin(omega_osc*time[0])
 dy[0] = omega_osc*A*np.cos(omega_osc*time[0])
 ddy[0] = -omega_osc**2*A*np.sin(omega_osc*time[0])
+
+print(y[0], dy[0])
 
 # Simulate dynamics and calculate forces by TD model
 for i in range(N-1):
@@ -76,13 +80,6 @@ for i in range(N-1):
     dy[i+1] = dy[i] + dt*ddy[i] # dt/M*(-C*dy[i]-K*y[i]+Fy[i])
     ddy[i+1] = 1/M*(-C*dy[i+1]-K*y[i+1]+Fy[i+1])
 
-time = time[:-1]
-y = y[:-1]
-dy = dy[:-1]
-ddy = ddy[:-1]
-Fy = Fy[:-1]
-#Fy[1]=[]
-
 # # take the 100 last T
 # Fy = Fy[i-int(np.floor(100*Tosc/dt)):i]  # obtained hydrodynamic force in CF (y) direction
 # dy = dy[i-int(np.floor(100*Tosc/dt)):i]
@@ -94,24 +91,21 @@ Fy = Fy[:-1]
 # ddy = ddy[:15000]
 # time = time[:15000]
 
+print(y[0], (y[1]-y[0])/dt)
+
 print(time)
 print(y)
-
-np.savez("data.npz", a = time, b = y)
-
-
-fig = plt.figure(figsize=(7,4))
-plt.plot(time, Fy, label='Force (N)')
-plt.plot(time, y*100, label=r'Displacement $\times 10^2$ (m)')
-# plt.xlim([12, 14])
-plt.title('Cross-flow force and displacement')
-plt.ylabel('Simulation')
-plt.xlabel('time (sec)')
-plt.legend()
-plt.show()
+time = time[:-1]
+y = y[:-1]
+dy = dy[:-1]
+H = 0.5*K*y**2 + 0.5*(M + D**2/4*rho*np.pi*Ca)*dy**2
+F = Fcv[:-1] + Fdy[:-1]
+np.savez("data.npz", a = time, b = y, c = F, d = H)
 '''
+
 fig = plt.figure(figsize=(7,4))
-plt.plot(time, y, label=r'Displacement (m)')
+plt.plot(time[:-1], Fy[:-1], label='Force (N)')
+plt.plot(time[:-1], y[:-1]*100, label=r'Displacement $\times 10^2$ (m)')
 # plt.xlim([12, 14])
 plt.title('Cross-flow force and displacement')
 plt.ylabel('Simulation')
@@ -120,10 +114,19 @@ plt.legend()
 plt.show()
 
 fig = plt.figure(figsize=(7,4))
-plt.plot(time, Fy, label='Force (N)')
-plt.plot(time, Fca, label='Fca (N)')
-plt.plot(time, Fcv, label='Fcv (N)')
-plt.plot(time, Fdy, label='Fd (N)')
+plt.plot(time[:-1], y[:-1], label=r'Displacement (m)')
+# plt.xlim([12, 14])
+plt.title('Cross-flow force and displacement')
+plt.ylabel('Simulation')
+plt.xlabel('time (sec)')
+plt.legend()
+plt.show()
+
+fig = plt.figure(figsize=(7,4))
+plt.plot(time[:-1], Fy[:-1], label='Force (N)')
+plt.plot(time[:-1], Fca[:-1], label='Fca (N)')
+plt.plot(time[:-1], Fcv[:-1], label='Fcv (N)')
+plt.plot(time[:-1], Fdy[:-1], label='Fd (N)')
 plt.xlim([12, 14])
 plt.title('Cross-flow force and displacement')
 plt.ylabel('Simulation')
@@ -132,9 +135,9 @@ plt.legend()
 plt.show()
 
 fig = plt.figure(figsize=(7,4))
-plt.plot(time, Fy, label='Force (N)')
-plt.plot(time, Fcv+Fdy, label='Fcv+Fdy (N)')
-plt.plot(time, Fca, label='Fca (N)')
+plt.plot(time[:-1], Fy[:-1], label='Force (N)')
+plt.plot(time[:-1], (Fcv+Fdy)[:-1], label='Fcv+Fdy (N)')
+plt.plot(time[:-1], Fca[:-1], label='Fca (N)')
 plt.xlim([12, 14])
 plt.title('Cross-flow force and displacement')
 plt.ylabel('Simulation')
@@ -143,9 +146,9 @@ plt.legend()
 plt.show()
 
 fig = plt.figure(figsize=(7,4))
-plt.plot(time, dy*100, label='velox10 (m/s)')
-plt.plot(time, Fcv+Fdy, label='Fcv+Fdy (N)')
-plt.plot(time, Fca, label='Fca (N)')
+plt.plot(time[:-1], dy[:-1]*100, label='velox10 (m/s)')
+plt.plot(time[:-1], (Fcv+Fdy)[:-1], label='Fcv+Fdy (N)')
+plt.plot(time[:-1], Fca[:-1], label='Fca (N)')
 plt.xlim([12, 14])
 plt.title('Cross-flow force and displacement')
 plt.ylabel('Simulation')
@@ -190,5 +193,4 @@ plt.plot(theta_data, fhat_data, '-k')
 plt.ylabel('Normalized frequency fhat')
 plt.xlabel(r'CF phase $\theta$ btw cylinder velocity and vortex shedding force Fcv')
 plt.show()
-
 '''
