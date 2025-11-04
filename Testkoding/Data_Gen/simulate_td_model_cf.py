@@ -100,9 +100,12 @@ y = y[:-1]
 dy = dy[:-1]
 H = 0.5*K*y**2 + 0.5*(M + D**2/4*rho*np.pi*Ca)*dy**2
 F = Fcv[:-1] + Fdy[:-1]
-np.savez("data.npz", a = time, b = y, c = F, d = H)
-'''
 
+np.savez("data.npz", a = time, b = y, c = F, d = H)
+
+data = np.load('data.npz')
+print(data['c'])
+'''
 fig = plt.figure(figsize=(7,4))
 plt.plot(time[:-1], Fy[:-1], label='Force (N)')
 plt.plot(time[:-1], y[:-1]*100, label=r'Displacement $\times 10^2$ (m)')

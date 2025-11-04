@@ -27,10 +27,12 @@ def main():
         F_data = F_data[mask]
         H_data = H_data[mask]
 
+    '''
     t = t[::10]
     y_data = y_data[::10]
     F_data = F_data[::10]
     H_data = H_data[::10]
+    '''
 
     dt = float(t[1] - t[0])
     middle_time_plot = [15, 17]
@@ -69,7 +71,8 @@ def main():
     run_dir = os.path.join("HNNruns", f"hnn_{time.strftime('%Y%m%d-%H%M%S')}")
     writer = SummaryWriter(log_dir=run_dir)
 
-    batch_size = 256
+    batch_size = 128
+    rollout_steps = 50
     force_reg = 1e-3
     max_grad_norm = 1e4
     lr = 1e-3
@@ -82,14 +85,14 @@ def main():
     hamiltonian_data = H_data
 
     t_tensor = torch.from_numpy(t).float().to(device)
-    dataset = build_dataset(y_data_t, vel, m_eff, t_tensor)
+    dataset = build_rollout_dataset(y_data_t, vel, m_eff, t_tensor, rollout_steps)
     train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
     y_true_norm = y_data / D
     force_data = F_data
 
-    epochs = 20000
-    rollout_every_epoch = 1000
+    epochs = 1000
+    rollout_every_epoch = 5
     opt = optim.Adam(model.parameters(), lr=lr)
 
     for epoch in range(epochs):
@@ -99,16 +102,25 @@ def main():
         grad_norms: list[float] = []
         avg_forces: list[float] = []
 
+        """
+
         for z_i, t_i, z_next, t_next in train_loader:
             z_i = z_i.to(device)
             t_i = t_i.to(device)
             z_next = z_next.to(device)
             t_next = t_next.to(device)
+        """
+        for z0, t_seq, z_seq in train_loader:
+            z0 =z0.to(device)
+            t_seq = t_seq.to(device)
+            z_seq = z_seq.to(device)
 
             opt.zero_grad()
-
-            res_loss = model.res_loss(z_i, t_i, z_next, t_next)
-            avg_force = model.avg_force(z_i, t_i, z_next, t_next)
+            Z_pred, F_hist = model.rollout(z0, t_seq)
+            res_loss = model.traj_loss(Z_pred, z_seq)
+            avg_force = model.power_loss(t_seq, Z_pred, F_hist, m_eff, model.get_damping())
+            #res_loss = model.res_loss(z_i, t_i, z_next, t_next)
+            #avg_force = model.avg_force(z_i, t_i, z_next, t_next)
             force_loss = force_reg * avg_force
             loss = res_loss + force_loss
             loss.backward()

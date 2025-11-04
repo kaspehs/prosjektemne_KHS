@@ -128,6 +128,14 @@ class PHVIV(nn.Module):
         R[..., 1, 1] = c_eff
         return R
     
+    def get_damping(self):
+        if self.discover_damping:
+            zeta = torch.sigmoid(self.zeta_raw) * self.max_damping_ratio
+            c_eff = 2.0 * zeta * torch.sqrt(torch.tensor(self.k * self.m))
+        else:
+            c_eff = self.fixed_c
+        return c_eff
+    
     def drag_force(self, x):
         """
         Morison-like cross-flow drag: Fd = -0.5 * rho * D * Cd * |v| * v
@@ -180,13 +188,13 @@ class PHVIV(nn.Module):
         return x + dt * self.f(x)
 
     def step_rk4(self, x, t, dt):
-        k1 = self.g(x)
-        k2 = self.g(x + 0.5 * dt * k1)
-        k3 = self.g(x + 0.5 * dt * k2)
-        k4 = self.g(x + dt * k3)
-        return x + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+        k1, F1 = self.g(x) , self.f(x)
+        k2, F2 = self.g(x + 0.5 * dt * k1) , self.f(x + 0.5 * dt * k1)
+        k3, F3 = self.g(x + 0.5 * dt * k2), self.f(x + 0.5 * dt * k2)
+        k4, F4 = self.g(x + dt * k3), self.f(x + dt * k3)
+        return x + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4), (F1 + 2*F2 + 2*F3 + F4) / 6.0
     
-    def rollout(self, z0, t_seq, dt):
+    def rollout(self, z0, t_seq):
         """
         z0: (B, state_dim)    starting state from data
         t_seq: (B, K+1)       absolute times t0..tK
@@ -199,27 +207,40 @@ class PHVIV(nn.Module):
         K = t_seq.shape[1] - 1
 
         Z_pred = [z0]
-        F_hist = []
+        forces = []
 
         z = z0
         for k in range(K):
             t = t_seq[:, k]
-            z, Fk = self.rk4_step(z, t, dt)   # model.g(y,p,t)->(dzdt,F)
+            z, Fk = self.step_rk4(z, t, self.dt)   # model.g(y,p,t)->(dzdt,F)
             Z_pred.append(z)
-            #F_hist.append(Fk.unsqueeze(-1))
+            forces.append(Fk[..., 1].unsqueeze(-1))  # only the force channel
 
+        F_hist = torch.stack([torch.zeros_like(forces[0])] + forces, dim=1).squeeze(-1)  # (batch, K+1)
         Z_pred = torch.stack(Z_pred, dim=1)            # (B,K+1,D)
         #F_hist = torch.stack([torch.zeros_like(F_hist[0])] + F_hist, dim=1) if F_hist else None
         return Z_pred, F_hist
 
-    def traj_loss(Z_pred, Z_data, w_state=(1.0, 1.0)):
+    def traj_loss(self, Z_pred, Z_data, w_state=(1.0, 1.0)):
         # For 1-DOF, assume z=[y,p]
         y_pred, p_pred = Z_pred[...,0], Z_pred[...,1]
         y_data, p_data = Z_data[...,0], Z_data[...,1]
         Ly = ((y_pred - y_data)**2).mean()
         Lp = ((p_pred - p_data)**2).mean()
         return w_state[0]*Ly + w_state[1]*Lp
+    
+    def power_loss(self, t_seq, Z_pred, F_hist, m_eff, c):
+        # use velocity v = p/m_eff
+        p = Z_pred[...,1]
+        v = p / m_eff
+        t_mid = 0.5*(t_seq[:,1:] + t_seq[:,:-1])
+        dt = (t_seq[:,1:] - t_seq[:,:-1])
+        v_mid = 0.5*(v[:,1:] + v[:,:-1])
+        F_mid = 0.5*(F_hist[:,1:] + F_hist[:,:-1])
 
+        P_in   = (F_mid * v_mid * dt).sum(dim=1) / (t_seq[:,-1]-t_seq[:,0])
+        P_diss = ((c * (v_mid**2)) * dt).sum(dim=1) / (t_seq[:,-1]-t_seq[:,0])
+        return ((P_in - P_diss)**2).mean()
     
     def res_loss(self, zi, ti, zin, tin):
         return self.res_loss_SRK4(zi, ti, zin, tin)
@@ -548,6 +569,7 @@ def rollout_model(model: PHVIV, y0: torch.Tensor, vel: torch.Tensor, m_eff: floa
     force_model: list[float] = []
     hamiltonian_model_vals: list[float] = []
     with torch.no_grad():
+        dummy_t = torch.zeros(state.shape[0], device=device, dtype=state.dtype)
         for _ in range(len(t)):
             y_samples.append(float(state[0, 0].detach().cpu()))
             p_samples.append(float(state[0, 1].detach().cpu()))
@@ -562,7 +584,7 @@ def rollout_model(model: PHVIV, y0: torch.Tensor, vel: torch.Tensor, m_eff: floa
             force_drag.append(drag_force)
             force_total.append(total_force)
             hamiltonian_model_vals.append(H_val)
-            state = model.step_rk4(state, t, dt)
+            state, _ = model.step_rk4(state, dummy_t, dt)
     y_samples = np.asarray(y_samples)
     p_samples = np.asarray(p_samples)
     y_pred_norm = y_samples / D
