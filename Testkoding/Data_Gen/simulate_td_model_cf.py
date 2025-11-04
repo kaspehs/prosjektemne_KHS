@@ -93,16 +93,6 @@ for i in range(N-1):
 
 print(y[0], (y[1]-y[0])/dt)
 
-print(time)
-print(y)
-time = time[:-1]
-y = y[:-1]
-dy = dy[:-1]
-H = 0.5*K*y**2 + 0.5*(M + D**2/4*rho*np.pi*Ca)*dy**2
-F = Fcv[:-1] + Fdy[:-1]
-np.savez("data.npz", a = time, b = y, c = F, d = H)
-'''
-
 fig = plt.figure(figsize=(7,4))
 plt.plot(time[:-1], Fy[:-1], label='Force (N)')
 plt.plot(time[:-1], y[:-1]*100, label=r'Displacement $\times 10^2$ (m)')
@@ -167,6 +157,13 @@ plt.xlabel('time (sec)')
 plt.legend()
 plt.show()
 
+time = time[:-1]
+y = y[:-1]
+dy = dy[:-1]
+H = 0.5*K*y**2 + 0.5*(M + D**2/4*rho*np.pi*Ca)*dy**2
+F = Fcv[:-1] + Fdy[:-1]
+np.savez("data.npz", a = time, b = y, c = F, d = H)
+
 # Derive coefficients:
 
 # Excitation coefficient 
@@ -193,4 +190,3 @@ plt.plot(theta_data, fhat_data, '-k')
 plt.ylabel('Normalized frequency fhat')
 plt.xlabel(r'CF phase $\theta$ btw cylinder velocity and vortex shedding force Fcv')
 plt.show()
-'''

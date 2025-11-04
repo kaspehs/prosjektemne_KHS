@@ -26,12 +26,12 @@ def main():
         y_data = y_data[mask]
         F_data = F_data[mask]
         H_data = H_data[mask]
-
+    """
     t = t[::10]
     y_data = y_data[::10]
     F_data = F_data[::10]
     H_data = H_data[::10]
-
+    """
     dt = float(t[1] - t[0])
     middle_time_plot = [15, 17]
 
@@ -46,6 +46,7 @@ def main():
     m_eff = 16.79 + m_a
     k = 1218.0
     U = 0.65
+    C = 2.860085
     q_scale = D
     p_scale = np.sqrt(k / m_eff) * m_eff * D
     include_physical_drag = False  # Set to False to let NN learn the total force directly
@@ -61,7 +62,7 @@ def main():
         q_scale=q_scale,
         p_scale=p_scale,
         discover_damping=False,
-        damping_c=2.86,
+        damping_c=C,
         include_physical_drag=include_physical_drag,
         learn_hamiltonian=learn_hamiltonian,
     ).to(device)
@@ -70,7 +71,7 @@ def main():
     writer = SummaryWriter(log_dir=run_dir)
 
     batch_size = 256
-    force_reg = 1e-3
+    force_reg = 1e-2
     max_grad_norm = 1e4
     lr = 1e-3
 
@@ -88,8 +89,8 @@ def main():
     y_true_norm = y_data / D
     force_data = F_data
 
-    epochs = 20000
-    rollout_every_epoch = 1000
+    epochs = 2000
+    rollout_every_epoch = 200
     opt = optim.Adam(model.parameters(), lr=lr)
 
     for epoch in range(epochs):
@@ -146,6 +147,14 @@ def main():
             rollout = rollout_model(model, y_data_t, vel, m_eff, dt, t, D, k, device)
             rmse_eval = float(np.sqrt(np.mean((rollout["y_norm"] - y_true_norm) ** 2)))
             writer.add_scalar("val/rmse_y_over_D", rmse_eval, epoch + 1)
+            force_total_pred = np.asarray(rollout["force_total"]).reshape(-1)
+            force_target = np.asarray(force_data).reshape(-1)
+            min_len = min(force_total_pred.shape[0], force_target.shape[0])
+            if min_len > 0:
+                force_rmse = float(
+                    np.sqrt(np.mean((force_total_pred[:min_len] - force_target[:min_len]) ** 2))
+                )
+                writer.add_scalar("val/rmse_force_total", force_rmse, epoch + 1)
 
             zoom_mask = create_zoom_mask(t)
             middle_mask = create_window_mask(t, middle_time_plot)

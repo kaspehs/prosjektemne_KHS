@@ -66,4 +66,4 @@ def vforce_CF(Cv, Cd, Ca, fhat0, fhat_min, fhat_max, dt, N, rho, U, D, dy,
     # Total force in y (CF) direction 
     Fy = Fcv+Fdy+Fca
 
-    return Fy, phi_vy, sig_dy_r, sig_ddy_r, Fdy, Fcv, Fca
+    return Fy, phi_vy, sig_dy_r, sig_ddy_r, Fca, Fcv, Fdy

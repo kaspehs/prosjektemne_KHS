@@ -315,20 +315,28 @@ def log_displacement_plots(
     middle_mask,
     middle_window,
 ):
-    fig, (ax_full, ax_zoom, ax_middle) = plt.subplots(3, 1, figsize=(6, 9), sharex=False)
+    fig, axes = plt.subplots(4, 1, figsize=(6, 12), sharex=False)
+    ax_full, ax_diff, ax_zoom, ax_middle = axes
 
     ax_full.plot(t, y_true_norm, label="y/D (true)")
     ax_full.plot(t, y_pred_norm, label="y/D (pred)")
-    ax_full.plot(t, p_pred_norm, label="p_hat (pred)", linestyle="--", color="tab:purple")
     ax_full.set_xlabel("time")
     ax_full.set_ylabel("y/D")
     ax_full.grid(True, alpha=0.3)
     ax_full.set_title(f"Normalized rollout at epoch {epoch+1}")
     ax_full.legend(loc="upper right")
 
+    diff_y_norm = y_pred_norm - y_true_norm
+    ax_diff.plot(t, diff_y_norm, label="Δ(y/D)", color="tab:orange")
+    ax_diff.axhline(0.0, color="black", linewidth=0.8, linestyle="--")
+    ax_diff.set_xlabel("time")
+    ax_diff.set_ylabel("Δy/D")
+    ax_diff.grid(True, alpha=0.3)
+    ax_diff.set_title(f"Difference (pred - true) epoch {epoch+1}")
+    ax_diff.legend(loc="upper right")
+
     ax_zoom.plot(t[zoom_mask], y_true_norm[zoom_mask], label="y/D (true)")
     ax_zoom.plot(t[zoom_mask], y_pred_norm[zoom_mask], label="y/D (pred)")
-    ax_zoom.plot(t[zoom_mask], p_pred_norm[zoom_mask], label="p_hat (pred)", linestyle="--", color="tab:purple")
     ax_zoom.set_xlabel("time")
     ax_zoom.set_ylabel("y/D")
     ax_zoom.grid(True, alpha=0.3)
@@ -338,13 +346,6 @@ def log_displacement_plots(
     mid_start, mid_end = middle_window
     ax_middle.plot(t[middle_mask], y_true_norm[middle_mask], label="y/D (true)")
     ax_middle.plot(t[middle_mask], y_pred_norm[middle_mask], label="y/D (pred)")
-    ax_middle.plot(
-        t[middle_mask],
-        p_pred_norm[middle_mask],
-        label="p_hat (pred)",
-        linestyle="--",
-        color="tab:purple",
-    )
     ax_middle.set_xlabel("time")
     ax_middle.set_ylabel("y/D")
     ax_middle.grid(True, alpha=0.3)
@@ -368,7 +369,8 @@ def log_force_plots(
     middle_window,
     include_physical_drag: bool,
 ):
-    fig, (ax_full, ax_zoom, ax_middle) = plt.subplots(3, 1, figsize=(6, 9), sharex=False)
+    fig, axes = plt.subplots(4, 1, figsize=(6, 12), sharex=False)
+    ax_full, ax_diff, ax_zoom, ax_middle = axes
     total_label = "F_total (model + drag)" if include_physical_drag else "F_total (model)"
     model_label = "F_model (wake)" if include_physical_drag else "F_model"
 
@@ -382,6 +384,15 @@ def log_force_plots(
     ax_full.grid(True, alpha=0.3)
     ax_full.set_title(f"Force rollout at epoch {epoch+1}")
     ax_full.legend(loc="upper right")
+
+    diff_force = force_total - force_data
+    ax_diff.plot(t, diff_force, label="ΔF_total", color="tab:orange")
+    ax_diff.axhline(0.0, color="black", linewidth=0.8, linestyle="--")
+    ax_diff.set_xlabel("time")
+    ax_diff.set_ylabel("ΔForce")
+    ax_diff.grid(True, alpha=0.3)
+    ax_diff.set_title(f"Force difference (model - data) epoch {epoch+1}")
+    ax_diff.legend(loc="upper right")
 
     ax_zoom.plot(t[zoom_mask], force_total[zoom_mask], label=total_label, color="tab:purple")
     if include_physical_drag:
@@ -432,7 +443,8 @@ def log_hamiltonian_plots(
     middle_window,
     hamiltonian_data: np.ndarray | None = None,
 ):
-    fig, (ax_full, ax_zoom, ax_middle) = plt.subplots(3, 1, figsize=(6, 9), sharex=False)
+    fig, axes = plt.subplots(4, 1, figsize=(6, 12), sharex=False)
+    ax_full, ax_diff, ax_zoom, ax_middle = axes
     model_kwargs = {"color": "tab:orange", "label": "H_model"}
     data_kwargs = {"color": "tab:blue", "linestyle": "--", "alpha": 0.8, "label": "H_data"}
 
@@ -449,6 +461,18 @@ def log_hamiltonian_plots(
     ax_full.grid(True, alpha=0.3)
     ax_full.set_title(f"Hamiltonian rollout at epoch {epoch+1}")
     ax_full.legend(loc="upper right")
+
+    if hamiltonian_data is not None:
+        diff_h = h_model_rel - h_data_rel
+        ax_diff.plot(t, diff_h, label="ΔH", color="tab:purple")
+    else:
+        ax_diff.plot(t, np.zeros_like(t), label="ΔH (no data)", color="tab:gray", linestyle="--")
+    ax_diff.axhline(0.0, color="black", linewidth=0.8, linestyle="--")
+    ax_diff.set_xlabel("time")
+    ax_diff.set_ylabel("ΔH")
+    ax_diff.grid(True, alpha=0.3)
+    ax_diff.set_title(f"Hamiltonian difference epoch {epoch+1}")
+    ax_diff.legend(loc="upper right")
 
     ax_zoom.plot(t[zoom_mask], h_model_rel[zoom_mask], **model_kwargs.copy())
     if hamiltonian_data is not None:
