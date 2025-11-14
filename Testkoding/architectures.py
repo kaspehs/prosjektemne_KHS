@@ -102,7 +102,6 @@ class RandomFactorizedLinear(nn.Module):
         W_eff = torch.exp(self.s).unsqueeze(1) * self.V  # (out, in)
         return F.linear(x, W_eff, self.bias)
 
-
 class SimpleMLP(torch.nn.Module):
     def __init__(self, input_size, hidden_size, output_size, num_hidden_layers: int = 4,
                  hidden_sizes=None, activation=torch.nn.Tanh, fourier_features: int = 16, sigma: float = 1.0,
@@ -215,9 +214,6 @@ class SirenMLP(torch.nn.Module):
         y = self.out(h)
         return self.final_activation(y) if self.final_activation is not None else y
     
-
-
-
 class FourierFeatures(torch.nn.Module):
     """Legacy joint Random Fourier features: kept for backward compatibility."""
     def __init__(self, in_dim: int, out_features: int, sigma: float = 1.0, dtype=torch.float64):
@@ -517,7 +513,6 @@ class PirateNet(torch.nn.Module):
                 "y_hat_sample": y_hat[:10].detach(), # small peek
             }
 
-
 class ODEPirateNet(torch.nn.Module):
     """
     PirateNet: A flexible residual MLP with optional Fourier features and sine activations.
@@ -544,7 +539,7 @@ class ODEPirateNet(torch.nn.Module):
     def __init__(self,
                  input_size: int,
                  output_size: int,
-                 depth: int = 6,
+                 depth: int = 2,
                  fourier_features: int | None = None,
                  sigma: float | None = None,
                  dtype: torch.dtype = torch.float32,

@@ -5,7 +5,108 @@ from torch.utils.data import TensorDataset
 import math
 import matplotlib.pyplot as plt
 
+from architectures import ODEPirateNet, FourierFeatures
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from rainflow import count_cycles as _rainflow_count_cycles
+
+class Residual(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.fc1 = nn.Linear(dim, dim)
+        self.fc2 = nn.Linear(dim, dim)
+
+    def forward(self, x):
+        out = F.gelu(self.fc1(x))
+        out = self.fc2(out)
+        return F.gelu(out + x)  
+
+def dominant_frequency(signal: np.ndarray, dt: float) -> float:
+    """Return dominant frequency (Hz) of the provided signal using FFT."""
+    if dt <= 0.0:
+        return float("nan")
+    signal = np.asarray(signal)
+    if signal.size < 2:
+        return float("nan")
+    centered = signal - np.mean(signal)
+    if np.allclose(centered, 0.0):
+        return float("nan")
+    fft_vals = np.fft.rfft(centered)
+    freqs = np.fft.rfftfreq(centered.size, d=dt)
+    if freqs.size <= 1:
+        return float("nan")
+    magnitudes = np.abs(fft_vals)
+    magnitudes[0] = 0.0  # ignore DC component
+    dominant_idx = int(np.argmax(magnitudes))
+    dominant_mag = magnitudes[dominant_idx]
+    if dominant_mag <= 0.0:
+        return float("nan")
+    return float(freqs[dominant_idx])
+
+
+def relative_error(model_value: float, true_value: float, eps: float = 1e-12) -> float:
+    """Compute |model - true| / |true| with small epsilon safeguard."""
+    if not np.isfinite(true_value) or not np.isfinite(model_value):
+        return float("nan")
+    denom = abs(true_value)
+    if denom <= eps:
+        return float("nan")
+    return float(abs(model_value - true_value) / (denom + eps))
+
+
+def spectral_relative_error(
+    true_signal: np.ndarray,
+    model_signal: np.ndarray,
+    dt: float,
+    eps: float = 1e-12,
+) -> float:
+    """
+    Compute relative L2 error between FFT magnitudes of true and model signals.
+    Signals are centered and windowed with a Hann taper to reduce leakage.
+    """
+    if dt <= 0.0:
+        return float("nan")
+    true_signal = np.asarray(true_signal)
+    model_signal = np.asarray(model_signal)
+    length = min(true_signal.size, model_signal.size)
+    if length < 2:
+        return float("nan")
+    true_trim = true_signal[-length:]
+    model_trim = model_signal[-length:]
+    window = np.hanning(length)
+    true_proc = (true_trim - np.mean(true_trim)) * window
+    model_proc = (model_trim - np.mean(model_trim)) * window
+    true_fft = np.abs(np.fft.rfft(true_proc))
+    model_fft = np.abs(np.fft.rfft(model_proc))
+    if true_fft.size == 0:
+        return float("nan")
+    true_fft[0] = 0.0
+    model_fft[0] = 0.0
+    denom = np.linalg.norm(true_fft)
+    if denom <= eps:
+        return float("nan")
+    return float(np.linalg.norm(model_fft - true_fft) / (denom + eps))
+
+
+def fatigue_damage(signal: np.ndarray, exponent: float = 3.0) -> float:
+    """Return cumulative fatigue damage using rainflow counting and range^exponent."""
+    signal = np.asarray(signal, dtype=float)
+    if signal.size < 3 or not np.all(np.isfinite(signal)):
+        return float("nan")
+    cycles = _rainflow_count_cycles(signal)
+    damage = 0.0
+    for cycle in cycles:
+        if len(cycle) == 3:
+            rng, mean, count = cycle
+        else:
+            rng, count = cycle
+        rng = abs(float(rng))
+        cnt = float(count)
+        if rng > 0.0 and cnt > 0.0:
+            damage += (rng ** exponent) * cnt
+    return float(damage)
 
 class PHVIV(nn.Module):
     """
@@ -28,6 +129,12 @@ class PHVIV(nn.Module):
         damping_c: float | None = None,
         include_physical_drag: bool = True,
         learn_hamiltonian: bool = False,
+        use_pirate_force: bool = False,
+        pirate_force_kwargs: dict | None = None,
+        use_fourier_features: bool = False,
+        fourier_features: int = 64,
+        fourier_sigma: float = 1.0,
+        use_feature_engineering: bool = False,
     ):
         super().__init__()
         self.dt = dt
@@ -42,27 +149,74 @@ class PHVIV(nn.Module):
         self.discover_damping = bool(discover_damping)
         self.include_physical_drag = bool(include_physical_drag)
         self.learn_hamiltonian = bool(learn_hamiltonian)
+        self.use_feature_engineering = bool(use_feature_engineering)
+        self.engineered_feature_dim = 7
+        self.force_input_dim = self.engineered_feature_dim if self.use_feature_engineering else 2
 
         self.nn_q_scale = q_scale
         self.nn_p_scale = p_scale
         self.q_scale = 1.0
         self.p_scale = 1.0
+        self.residual_net = True
 
         # NN for instantaneous force u(x)
-        self.u_net = nn.Sequential(
-            nn.Linear(2, 100),
-            nn.Tanh(),
-            nn.Linear(100, 100),
-            nn.ReLU(),
-            nn.Linear(100, 1),
-        )
+        pirate_force_kwargs = pirate_force_kwargs or {}
+        self.use_pirate_force = bool(use_pirate_force)
+        self.use_fourier_features = bool(use_fourier_features)
+        self.fourier_features = int(fourier_features)
+        self.fourier_sigma = float(fourier_sigma)
+        self.force_embed = None
+        base_force_dim = self.force_input_dim
+        force_in_features = base_force_dim
+        if self.use_fourier_features:
+            if self.fourier_features < 1:
+                raise ValueError("fourier_features must be >= 1 when use_fourier_features is True")
+            if self.use_pirate_force:
+                raise ValueError(
+                    "Random Fourier features are already handled inside ODEPirateNet. "
+                    "Disable use_fourier_features when use_pirate_force is True."
+                )
+            self.force_embed = FourierFeatures(
+                in_dim=base_force_dim,
+                out_features=self.fourier_features,
+                sigma=self.fourier_sigma,
+                dtype=torch.float32,
+            )
+            force_in_features = 2 * self.fourier_features
+
+        if self.use_pirate_force:
+            pirate_args = {
+                "input_size": base_force_dim,
+                "output_size": 1,
+                "fourier_features": 64,
+                "sigma": 1.0,
+                "use_rwf": True
+            }
+            pirate_args.update(pirate_force_kwargs)
+            self.u_net = ODEPirateNet(**pirate_args)
+        elif self.residual_net:
+            self.u_net = nn.Sequential(
+                nn.Linear(force_in_features, 128),
+                Residual(128),
+                Residual(128),
+                nn.Linear(128, 1),
+            ) 
+        else:
+            self.u_net = nn.Sequential(
+                nn.Linear(force_in_features, 100),
+                nn.GELU(),
+                nn.Linear(100, 100),
+                nn.GELU(),
+                nn.Linear(100, 1),
+            )
 
         if self.learn_hamiltonian:
+            h_in_features = self.force_input_dim
             self.h_net = nn.Sequential(
-                nn.Linear(2, 100),
-                nn.Tanh(),
+                nn.Linear(h_in_features, 100),
+                nn.GELU(),
                 nn.Linear(100, 100),
-                nn.ReLU(),
+                nn.GELU(),
                 nn.Linear(100, 1),
             )
         else:
@@ -95,11 +249,8 @@ class PHVIV(nn.Module):
             q = x[..., 0]
             p = x[..., 1]
             return 0.5 * self.k * q**2 + 0.5 * p**2 / self.m
-        x_scaled = torch.stack(
-            (x[..., 0] / self.nn_q_scale, x[..., 1] / self.nn_p_scale),
-            dim=-1,
-        )
-        return self.h_net(x_scaled).squeeze(-1)
+        features = self._base_features(x)
+        return self.h_net(features).squeeze(-1)
 
     def grad_H(self, x):
         if not self.learn_hamiltonian:
@@ -142,11 +293,17 @@ class PHVIV(nn.Module):
         return Fd.unsqueeze(-1)
 
 
-    def u_theta1(self, x):
+    def _base_features(self, x):
+        if self.use_feature_engineering:
+            return self.feature_engineering(x)
         q_scaled = x[..., 0] / self.nn_q_scale
         p_scaled = x[..., 1] / self.nn_p_scale
-        x_scaled = torch.stack((q_scaled, p_scaled), dim=-1)
-        return self.u_net(x_scaled) * self.k * self.D
+        return torch.stack((q_scaled, p_scaled), dim=-1)
+
+    def u_theta1(self, x):
+        base_features = self._base_features(x)
+        features = self.force_embed(base_features) if self.force_embed is not None else base_features
+        return self.u_net(features) * self.k * self.D
     
     def u_theta2(self, x):
         return self.u_theta1(x) + self.drag_force(x)
@@ -177,15 +334,36 @@ class PHVIV(nn.Module):
         return core + self.f(x)
 
     def step_euler(self, x, dt):
-        return x + dt * self.f(x)
+        return x + dt * self.g(x)
 
     def step_rk4(self, x, t, dt):
+        x_next, _ = self.rk4_step(x, t, dt)
+        return x_next
+
+    def rk4_step(self, x, t, dt):
+        """
+        Perform one Runge-Kutta 4 integration step and return both the next state
+        and the averaged force over the step.
+        """
         k1 = self.g(x)
-        k2 = self.g(x + 0.5 * dt * k1)
-        k3 = self.g(x + 0.5 * dt * k2)
-        k4 = self.g(x + dt * k3)
-        return x + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
-    
+        force1 = self.u_theta(x)
+
+        x2 = x + 0.5 * dt * k1
+        k2 = self.g(x2)
+        force2 = self.u_theta(x2)
+
+        x3 = x + 0.5 * dt * k2
+        k3 = self.g(x3)
+        force3 = self.u_theta(x3)
+
+        x4 = x + dt * k3
+        k4 = self.g(x4)
+        force4 = self.u_theta(x4)
+
+        x_next = x + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+        force_avg = (force1 + 2.0 * force2 + 2.0 * force3 + force4) / 6.0
+        return x_next, force_avg
+
     def rollout(self, z0, t_seq, dt):
         """
         z0: (B, state_dim)    starting state from data
@@ -204,14 +382,19 @@ class PHVIV(nn.Module):
         z = z0
         for k in range(K):
             t = t_seq[:, k]
-            z, Fk = self.rk4_step(z, t, dt)   # model.g(y,p,t)->(dzdt,F)
+            z, Fk = self.rk4_step(z, t, dt)
             Z_pred.append(z)
-            #F_hist.append(Fk.unsqueeze(-1))
+            F_hist.append(Fk)
 
         Z_pred = torch.stack(Z_pred, dim=1)            # (B,K+1,D)
-        #F_hist = torch.stack([torch.zeros_like(F_hist[0])] + F_hist, dim=1) if F_hist else None
+        if F_hist:
+            initial_force = self.u_theta(z0)
+            F_hist = torch.stack([initial_force] + F_hist, dim=1)
+        else:
+            F_hist = None
         return Z_pred, F_hist
 
+    @staticmethod
     def traj_loss(Z_pred, Z_data, w_state=(1.0, 1.0)):
         # For 1-DOF, assume z=[y,p]
         y_pred, p_pred = Z_pred[...,0], Z_pred[...,1]
@@ -238,10 +421,8 @@ class PHVIV(nn.Module):
 
     def avg_force_Euler(self, zi, ti, zin, tin):
         z_mean = 0.5*(zin+zi)
-        forces = self.f(z_mean)
-        scale = torch.tensor((self.q_scale, self.p_scale), device=forces.device, dtype=forces.dtype)
-        forces_scaled = forces / scale
-        loss = torch.mean(torch.linalg.norm(forces_scaled, ord=1, dim=1))
+        forces = self.learned_force(z_mean)
+        loss = torch.mean(torch.linalg.norm(forces, ord=1, dim=1))
         return loss
     
 
@@ -303,6 +484,24 @@ class PHVIV(nn.Module):
         loss = 0.5 * torch.mean(torch.sum(torch.abs(f1), dim=1)) \
             + 0.5 * torch.mean(torch.sum(torch.abs(f2), dim=1))
         return loss
+    
+    def feature_engineering(self, z):
+        q_scaled = z[..., 0] / self.nn_q_scale
+        p_scaled = z[..., 1] / self.nn_p_scale
+        theta = torch.atan2(p_scaled, q_scaled)
+        z_eng = torch.stack(
+            (
+                q_scaled,
+                q_scaled**2,
+                p_scaled,
+                p_scaled**2,
+                q_scaled * p_scaled,
+                torch.cos(theta),
+                torch.sin(theta),
+            ),
+            dim=-1,
+        )
+        return z_eng
 
 def log_displacement_plots(
     writer,

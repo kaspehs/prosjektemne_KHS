@@ -1,192 +1,243 @@
-import numpy as np
+"""
+Reusable simulator for the TD cross-flow model plus batch generation helpers.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Dict
+
 import matplotlib.pyplot as plt
+import numpy as np
+
 from utils import vforce_CF
-#import imp
-#imp.reload(utils)
 
-"""
-    Simulating...
-"""
+# Base physical parameters
+M = 16.79            # mass kg
+zeta = 0.01          # structural damping
+K = 1218.0           # stiffness N/m
+rho = 1000.0         # fluid density (kg/m3)
+U = 0.65             # flow speed (m/s)
+D = 0.1              # cylinder diameter (m)
+C = 1e-4             # damping (overrides 2*zeta*np.sqrt(M*K))
+n_memory = 500       # timesteps for instantaneous velocity calculation
 
-# Case input
-M = 16.79           # mass kg
-zeta = 0.01             # structural damping
-K = 1218            # stiffness N/m
-rho = 1000        # fluid density (kg/m3)
-U = 0.65           # flow speed (m/s)
-D = 0.1      # diameter of the cylinder (m)
-C = 2*zeta*np.sqrt(M*K)
-print(C)
-nsteps = 200     # number of timesteps per cycle
-n_memory = 500   # number of timesteps for calculation of instantaneous velocity
-
-# empirical force coefficients in TD model
-Cv = 1.2    # vortex shedding force coefficient in time domain model (-)
-Cd = 1.2    # drag coefficient in time domain model (-)
-Ca = 1.0    # added mass coefficient in still water (-)
+# Empirical force coefficients in TD model
+Cv = 1.2             # vortex shedding coefficient
+Cd = 1.2             # drag coefficient
+Ca = 1.0             # added mass coefficient in still water
 
 # Synchronization model parameters
-fhat0 = 0.144              # center of the synchronization in terms of fhat (-)
-fhat_min = 0.08     # lower normalized frequency limit
-fhat_max = 0.206 # higher normalized frequency limit
+fhat0 = 0.144        # centre of synchronization
+fhat_min = 0.08
+fhat_max = 0.206
 
-# 
-dt = 0.001                # time step
-T = 20                  # 
-N = int(np.ceil(T/dt))
+T = 20.0
+dt = 0.0001
 
-U_r = 2*np.pi * U / D * np.sqrt((M + D**2*np.pi/4*rho)/K)
+def simulate_td_model_cf(
+    A_factor: float = 1.0,
+    fhat: float = 0.1,
+    dt: float = dt,
+    T: float = T,
+    output_path: str | Path | None = "data.npz",
+    plot: bool = False,
+    seed: int | None = None,
+    verbose: bool = False,
+    integrator: str = "rk4",
+) -> Dict[str, np.ndarray]:
+    """
+    Simulate the TD model for a single set of initial conditions.
 
-print(f'Reduced velocity: {U_r}')
+    Args:
+        A_factor: multiplier applied to D to set the displacement amplitude.
+        fhat: normalized frequency used for the initial harmonic displacement.
+        dt: timestep size.
+        T: total simulation time.
+        output_path: where to store the npz file; set to None to skip saving.
+        plot: whether to show diagnostic plots.
+        seed: optional RNG seed for the initial vortex shedding phase.
+        verbose: print reduced velocity and damping info when True.
+        integrator: "rk4" (default) for Runge-Kutta 4 or "euler" for explicit Euler.
 
-# preallocate space
-time = np.zeros(N)   # time
-y = np.zeros(N)      # displacement in y dir (CF)
-dy = np.zeros(N)     # velocity
-ddy = np.zeros(N)    # acceleration
-Fy = np.zeros(N)    # Hydrodynamic force in y dir (CF)
-Fcv = np.zeros(N)    # Hydrodynamic force in y dir (CF)
-Fdy = np.zeros(N)    # Hydrodynamic force in y dir (CF)
-Fca = np.zeros(N)    # Hydrodynamic force in y dir (CF)
+    Returns:
+        Dictionary with time, displacement, force, Hamiltonian, velocity, etc.
+    """
+    if A_factor <= 0.0:
+        raise ValueError("A_factor must be positive.")
+    if fhat <= 0.0:
+        raise ValueError("fhat must be positive.")
+    if dt <= 0.0:
+        raise ValueError("dt must be positive.")
+    if T <= 0.0:
+        raise ValueError("T must be positive.")
 
-phi_vy = np.zeros(N)                # phase of vortex shedding force
-phi_vy[0] = 2*np.pi*np.random.rand(1)   # random initial value
-sig_dy_loc = np.zeros(N)            # to calculate instantaneous phase of cylinder velocity
-mean_dy_loc = np.zeros(N)
-sig_ddy_loc = np.zeros(N)
-mean_ddy_loc = np.zeros(N)
+    integrator = integrator.lower()
+    if integrator not in {"euler", "rk4"}:
+        raise ValueError("integrator must be either 'euler' or 'rk4'.")
 
-# Initial conditions:
-A = 1.0*D
-fhat = 0.001
-omega_osc = 2*np.pi*fhat*U/D
-Tosc = 2*np.pi/omega_osc
-y[0] = A*np.sin(omega_osc*time[0])
-dy[0] = omega_osc*A*np.cos(omega_osc*time[0])
-ddy[0] = -omega_osc**2*A*np.sin(omega_osc*time[0])
+    rng = np.random.default_rng(seed)
 
-print(y[0], dy[0])
+    N = int(np.ceil(T / dt))
+    time = np.zeros(N)
+    y = np.zeros(N)
+    dy = np.zeros(N)
+    ddy = np.zeros(N)
+    Fy = np.zeros(N)
+    Fcv = np.zeros(N)
+    Fdy = np.zeros(N)
+    Fca = np.zeros(N)
 
-# Simulate dynamics and calculate forces by TD model
-for i in range(N-1):
-    time[i] = i*dt
+    phi_vy = np.zeros(N)
+    phi_vy[0] = 2.0 * np.pi * rng.random()
+    sig_dy_loc = np.zeros(N)
+    sig_ddy_loc = np.zeros(N)
 
-    Fy[i+1], phi_vy[i+1], sig_dy_loc[i+1], sig_ddy_loc[i+1], \
-        Fca[i+1], Fcv[i+1], Fdy[i+1]= \
-        vforce_CF(Cv,Cd,Ca,fhat0,fhat_min,fhat_max,dt,n_memory, rho, U, D, dy[i], \
-        ddy[i], phi_vy[i], sig_dy_loc[i], sig_ddy_loc[i])
-    
-    y[i+1] = y[i] + dt*dy[i]
-    dy[i+1] = dy[i] + dt*ddy[i] # dt/M*(-C*dy[i]-K*y[i]+Fy[i])
-    ddy[i+1] = 1/M*(-C*dy[i+1]-K*y[i+1]+Fy[i+1])
+    A = A_factor * D
+    omega_osc = 2.0 * np.pi * fhat * U / D
 
-# # take the 100 last T
-# Fy = Fy[i-int(np.floor(100*Tosc/dt)):i]  # obtained hydrodynamic force in CF (y) direction
-# dy = dy[i-int(np.floor(100*Tosc/dt)):i]
-# ddy = ddy[i-int(np.floor(100*Tosc/dt)):i]
-# time = time[i-int(np.floor(100*Tosc/dt)):i]
-# Fy = Fy[:15000]  # obtained hydrodynamic force in CF (y) direction
-# y = y[:15000]
-# dy = dy[:15000]
-# ddy = ddy[:15000]
-# time = time[:15000]
+    y[0] = A * np.sin(omega_osc * time[0])
+    dy[0] = omega_osc * A * np.cos(omega_osc * time[0])
+    ddy[0] = -omega_osc**2 * A * np.sin(omega_osc * time[0])
 
-print(y[0], (y[1]-y[0])/dt)
+    def acceleration(y_val: float, dy_val: float, force_val: float) -> float:
+        return (1.0 / M) * (-C * dy_val - K * y_val + force_val)
 
-fig = plt.figure(figsize=(7,4))
-plt.plot(time[:-1], Fy[:-1], label='Force (N)')
-plt.plot(time[:-1], y[:-1]*100, label=r'Displacement $\times 10^2$ (m)')
-# plt.xlim([12, 14])
-plt.title('Cross-flow force and displacement')
-plt.ylabel('Simulation')
-plt.xlabel('time (sec)')
-plt.legend()
-plt.show()
+    def rk4_step(y_val: float, dy_val: float, force_val: float, dt_val: float) -> tuple[float, float]:
+        def acc_local(y_state: float, dy_state: float) -> float:
+            return acceleration(y_state, dy_state, force_val)
 
-fig = plt.figure(figsize=(7,4))
-plt.plot(time[:-1], y[:-1], label=r'Displacement (m)')
-# plt.xlim([12, 14])
-plt.title('Cross-flow force and displacement')
-plt.ylabel('Simulation')
-plt.xlabel('time (sec)')
-plt.legend()
-plt.show()
+        k1_y = dy_val
+        k1_v = acc_local(y_val, dy_val)
 
-fig = plt.figure(figsize=(7,4))
-plt.plot(time[:-1], Fy[:-1], label='Force (N)')
-plt.plot(time[:-1], Fca[:-1], label='Fca (N)')
-plt.plot(time[:-1], Fcv[:-1], label='Fcv (N)')
-plt.plot(time[:-1], Fdy[:-1], label='Fd (N)')
-plt.xlim([12, 14])
-plt.title('Cross-flow force and displacement')
-plt.ylabel('Simulation')
-plt.xlabel('time (sec)')
-plt.legend()
-plt.show()
+        y_mid = y_val + 0.5 * dt_val * k1_y
+        v_mid = dy_val + 0.5 * dt_val * k1_v
+        k2_y = v_mid
+        k2_v = acc_local(y_mid, v_mid)
 
-fig = plt.figure(figsize=(7,4))
-plt.plot(time[:-1], Fy[:-1], label='Force (N)')
-plt.plot(time[:-1], (Fcv+Fdy)[:-1], label='Fcv+Fdy (N)')
-plt.plot(time[:-1], Fca[:-1], label='Fca (N)')
-plt.xlim([12, 14])
-plt.title('Cross-flow force and displacement')
-plt.ylabel('Simulation')
-plt.xlabel('time (sec)')
-plt.legend()
-plt.show()
+        y_mid = y_val + 0.5 * dt_val * k2_y
+        v_mid = dy_val + 0.5 * dt_val * k2_v
+        k3_y = v_mid
+        k3_v = acc_local(y_mid, v_mid)
 
-fig = plt.figure(figsize=(7,4))
-plt.plot(time[:-1], dy[:-1]*100, label='velox10 (m/s)')
-plt.plot(time[:-1], (Fcv+Fdy)[:-1], label='Fcv+Fdy (N)')
-plt.plot(time[:-1], Fca[:-1], label='Fca (N)')
-plt.xlim([12, 14])
-plt.title('Cross-flow force and displacement')
-plt.ylabel('Simulation')
-plt.xlabel('time (sec)')
-plt.legend()
-plt.show()
+        y_end = y_val + dt_val * k3_y
+        v_end = dy_val + dt_val * k3_v
+        k4_y = v_end
+        k4_v = acc_local(y_end, v_end)
+
+        y_next = y_val + (dt_val / 6.0) * (k1_y + 2.0 * k2_y + 2.0 * k3_y + k4_y)
+        v_next = dy_val + (dt_val / 6.0) * (k1_v + 2.0 * k2_v + 2.0 * k3_v + k4_v)
+        return y_next, v_next
+
+    if verbose:
+        U_r = 2 * np.pi * U / D * np.sqrt((M + D**2 * np.pi / 4.0 * rho) / K)
+        print(f"Reduced velocity: {U_r:.3f}, damping C={C:.3e}")
+
+    for i in range(N - 1):
+        time[i] = i * dt
+        (
+            Fy[i + 1],
+            phi_vy[i + 1],
+            sig_dy_loc[i + 1],
+            sig_ddy_loc[i + 1],
+            Fca[i + 1],
+            Fcv[i + 1],
+            Fdy[i + 1],
+        ) = vforce_CF(
+            Cv,
+            Cd,
+            Ca,
+            fhat0,
+            fhat_min,
+            fhat_max,
+            dt,
+            n_memory,
+            rho,
+            U,
+            D,
+            dy[i],
+            ddy[i],
+            phi_vy[i],
+            sig_dy_loc[i],
+            sig_ddy_loc[i],
+        )
+
+        if integrator == "rk4":
+            y_next, dy_next = rk4_step(y[i], dy[i], Fy[i + 1], dt)
+        else:
+            y_next = y[i] + dt * dy[i]
+            dy_next = dy[i] + dt * ddy[i]
+
+        y[i + 1] = y_next
+        dy[i + 1] = dy_next
+        ddy[i + 1] = acceleration(y_next, dy_next, Fy[i + 1])
+
+    # truncate the last element to keep shapes consistent with original script
+    time = time[:-1]
+    y = y[:-1]
+    dy = dy[:-1]
+    Fy = Fy[:-1]
+    Fcv = Fcv[:-1]
+    Fdy = Fdy[:-1]
+    Fca = Fca[:-1]
+
+    H = 0.5 * K * y**2 + 0.5 * (M + D**2 / 4.0 * rho * np.pi * Ca) * dy**2
+    F_total = Fcv + Fdy
+
+    if output_path is not None:
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez(output_path, a=time, b=y, c=F_total, d=H)
+
+    if plot:
+        _plot_diagnostics(time, y, dy, Fy, Fca, Fcv, Fdy)
+
+    return {
+        "time": time,
+        "y": y,
+        "dy": dy,
+        "Fy": Fy,
+        "F_total": F_total,
+        "Fca": Fca,
+        "Fcv": Fcv,
+        "Fdy": Fdy,
+        "H": H,
+    }
 
 
-fig = plt.figure(figsize=(7,4))
-plt.plot(time, dy*100, label='velox10 (m/s)')
-plt.plot(time, Fy, label='Fy (N)')
-plt.xlim([12, 14])
-plt.title('Cross-flow force and displacement')
-plt.ylabel('Simulation')
-plt.xlabel('time (sec)')
-plt.legend()
-plt.show()
+def _plot_diagnostics(time, y, dy, Fy, Fca, Fcv, Fdy):
+    fig = plt.figure(figsize=(7, 4))
+    plt.plot(time, Fy, label="Force (N)")
+    plt.plot(time, y * 100, label=r"Displacement $\times 10^2$ (m)")
+    plt.title("Cross-flow force and displacement")
+    plt.xlabel("time (sec)")
+    plt.ylabel("Simulation")
+    plt.legend()
+    plt.show()
 
-time = time[:-1]
-y = y[:-1]
-dy = dy[:-1]
-H = 0.5*K*y**2 + 0.5*(M + D**2/4*rho*np.pi*Ca)*dy**2
-F = Fcv[:-1] + Fdy[:-1]
-np.savez("data.npz", a = time, b = y, c = F, d = H)
+    fig = plt.figure(figsize=(7, 4))
+    plt.plot(time, Fy, label="Force (N)")
+    plt.plot(time, Fca, label="Fca (N)")
+    plt.plot(time, Fcv, label="Fcv (N)")
+    plt.plot(time, Fdy, label="Fd (N)")
+    plt.xlim([12, 14])
+    plt.title("Force breakdown")
+    plt.xlabel("time (sec)")
+    plt.ylabel("Simulation")
+    plt.legend()
+    plt.show()
 
-# Derive coefficients:
+    fig = plt.figure(figsize=(7, 4))
+    plt.plot(time, dy * 100, label="vel ×10 (m/s)")
+    plt.plot(time, Fcv + Fdy, label="Fcv+Fdy (N)")
+    plt.plot(time, Fca, label="Fca (N)")
+    plt.xlim([12, 14])
+    plt.title("Velocity vs. forces")
+    plt.xlabel("time (sec)")
+    plt.ylabel("Simulation")
+    plt.legend()
+    plt.show()
 
-# Excitation coefficient 
-Cy = Fy/(0.5*rho*D*U**2)                     # normalize force (force x velocity)
-CLv = 2*np.mean(Cy*np.cos(omega_osc*time)) # check multiplication!  # time averaged excitation coefficient
 
-# Added mass coefficient 
-Cya = Fy/(0.25*np.pi*D**2*rho*omega_osc**2*A)    # normalize force
-CLa = 2*np.mean(Cya*np.sin(omega_osc*time)) # check multiplication # time-averaged added mass coefficient (force x acceleration)
-
-# visualize synchronization curve
-theta_data = np.arange(-np.pi, np.pi, 0.01)  # Phase difference btw cylinder velocity and vortex shedding force Fcv
-fhat_data = np.zeros(theta_data.size)
-
-for i in range (theta_data.size): #c check size vs. length!
-    theta = theta_data[i]
-    if theta <= 0:
-        fhat_data[i] = fhat0+(fhat0-fhat_min)*np.sin(theta)
-    else:
-        fhat_data[i] = fhat0+(fhat_max-fhat0)*np.sin(theta)
-
-fig = plt.figure(figsize=(7,4))
-plt.plot(theta_data, fhat_data, '-k')
-plt.ylabel('Normalized frequency fhat')
-plt.xlabel(r'CF phase $\theta$ btw cylinder velocity and vortex shedding force Fcv')
-plt.show()
+if __name__ == "__main__":
+    simulate_td_model_cf(plot=True, verbose=True)
