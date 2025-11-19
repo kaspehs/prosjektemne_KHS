@@ -1,16 +1,281 @@
+import math
+import yaml
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import TensorDataset
-import math
-import matplotlib.pyplot as plt
-
-from architectures import ODEPirateNet, FourierFeatures
-
-import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.data import ConcatDataset, DataLoader, TensorDataset
+from torch.utils.tensorboard import SummaryWriter
+
 from rainflow import count_cycles as _rainflow_count_cycles
+
+try:
+    from scipy.signal import savgol_filter
+except ImportError:
+    savgol_filter = None
+
+from architectures import FourierFeatures, ODEPirateNet
+
+@dataclass
+class DataConfig:
+    file: str = "data.npz"
+    steadystate: bool = False
+    steadystate_time_threshold: float = 10.0
+    reduce_time: bool = False
+    reduction_factor: int = 1
+    middle_time_plot: list[float] = field(default_factory=lambda: [15.0, 17.0])
+    use_generated_train_series: bool = False
+    train_series_dir: str = "Data_Gen/generated_series"
+
+@dataclass
+class ModelConfig:
+    rho: float = 1000.0
+    D: float = 0.1
+    structural_mass: float = 16.79
+    Ca: float = 1.0
+    k: float = 1218.0
+    U: float = 0.65
+    damping_c: float = 1e-4
+    max_damping_ratio: float = 0.2
+    include_physical_drag: bool = False
+    learn_hamiltonian: bool = False
+    discover_damping: bool = False
+    use_pirate_force: bool = False
+    pirate_force_kwargs: dict[str, Any] = field(default_factory=dict)
+    use_fourier_features: bool = False
+    fourier_features: int = 64
+    fourier_sigma: float = 1.0
+    use_feature_engineering: bool = False
+    q_scale: float | None = None
+    p_scale: float | None = None
+
+@dataclass
+class ArchitectureConfig:
+    force_net_type: str = "residual"
+    residual_hidden: int = 128
+    residual_layers: int = 2
+    mlp_hidden: int = 100
+    mlp_layers: int = 2
+    activation: str = "tanh"
+    pirate_rwf_mu: float = 1.0
+    pirate_rwf_sigma: float = 0.1
+    pirate_force_kwargs: dict[str, Any] = field(default_factory=dict)
+
+@dataclass
+class SmoothingConfig:
+    use_savgol_smoothing: bool = True
+    window_length: int = 15
+    polyorder: int = 4
+
+@dataclass
+class SchedulerConfig:
+    max_lr: float = 5e-4
+    decay_rate: float = 0.9
+    warmup_steps: int = 1000
+    decay_steps: int = 1000
+
+@dataclass
+class TrainingConfig:
+    batch_size: int = 32
+    force_reg: float = 1e-2
+    max_grad_norm: float = 1e4
+    lr: float = 1e-3
+    epochs: int = 2000
+    rollout_every_epoch: int = 50
+    use_lr_scheduler: bool = False
+    scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
+
+@dataclass
+class LoggingConfig:
+    run_dir_root: str = "HNNruns"
+
+@dataclass
+class Config:
+    data: DataConfig = field(default_factory=DataConfig)
+    model: ModelConfig = field(default_factory=ModelConfig)
+    architecture: ArchitectureConfig = field(default_factory=ArchitectureConfig)
+    smoothing: SmoothingConfig = field(default_factory=SmoothingConfig)
+    training: TrainingConfig = field(default_factory=TrainingConfig)
+    logging: LoggingConfig = field(default_factory=LoggingConfig)
+
+
+def load_config(config_path: str | Path) -> dict[str, Any]:
+    path = Path(config_path)
+    with path.open("r", encoding="utf-8") as fh:
+        data = yaml.safe_load(fh) or {}
+    return data
+
+
+def parse_config(raw: dict[str, Any]) -> Config:
+    data_cfg = raw.get("data", {}) or {}
+    model_cfg = raw.get("model", {}) or {}
+    architecture_cfg = raw.get("architecture", {}) or {}
+    smoothing_cfg = raw.get("smoothing", {}) or {}
+    training_cfg = raw.get("training", {}) or {}
+    logging_cfg = raw.get("logging", {}) or {}
+
+    data = DataConfig(**data_cfg)
+    model = ModelConfig(**model_cfg)
+    architecture = ArchitectureConfig(**architecture_cfg)
+    smoothing = SmoothingConfig(**smoothing_cfg)
+    scheduler_dict = training_cfg.get("scheduler", {}) or {}
+    scheduler = SchedulerConfig(**scheduler_dict)
+    training_fields = {k: v for k, v in training_cfg.items() if k != "scheduler"}
+    training = TrainingConfig(**training_fields, scheduler=scheduler)
+    logging = LoggingConfig(**logging_cfg)
+    return Config(
+        data=data,
+        model=model,
+        architecture=architecture,
+        smoothing=smoothing,
+        training=training,
+        logging=logging,
+    )
+
+
+def log_training_metrics(
+    writer: SummaryWriter,
+    epoch: int,
+    metrics: dict[str, float],
+) -> str:
+    log_parts = [f"Epoch {epoch}"]
+    for name, value in metrics.items():
+        writer.add_scalar(f"train/{name}", value, epoch)
+        log_parts.append(f"{name}={value:.4e}")
+    return ", ".join(log_parts)
+
+
+def log_validation_epoch(
+    writer: SummaryWriter,
+    epoch: int,
+    model: "PHVIV",
+    y_data_t: torch.Tensor,
+    val_vel: torch.Tensor,
+    m_eff: float,
+    dt: float,
+    t: np.ndarray,
+    y_true_norm: np.ndarray,
+    y_data_raw: np.ndarray,
+    force_data: np.ndarray,
+    D: float,
+    k: float,
+    device: torch.device,
+    middle_time_plot: list[float] | tuple[float, float],
+    hamiltonian_data: np.ndarray | None,
+) -> dict[str, float]:
+    rollout = rollout_model(model, y_data_t, val_vel, m_eff, dt, t, D, k, device)
+    metrics: dict[str, float] = {}
+    y_pred_raw = rollout["y_norm"] * D
+    disp_range_raw = float(np.ptp(y_data_raw))
+    if disp_range_raw <= 0.0:
+        disp_range_raw = 1.0
+    rel_rmse_disp = float(np.sqrt(np.mean((y_pred_raw - y_data_raw) ** 2))) / disp_range_raw
+    metrics["rel_rmse_y"] = rel_rmse_disp
+    force_total_pred = np.asarray(rollout["force_total"]).reshape(-1)
+    force_target = np.asarray(force_data).reshape(-1)
+    min_len = min(force_total_pred.shape[0], force_target.shape[0])
+    if min_len > 0:
+        rmse_force = float(
+            np.sqrt(np.mean((force_total_pred[:min_len] - force_target[:min_len]) ** 2))
+        )
+        force_range = float(np.ptp(force_target[:min_len]))
+        if force_range <= 0.0:
+            force_range = 1.0
+        metrics["rel_rmse_force_total"] = rmse_force / force_range
+        force_model_aligned = force_total_pred[:min_len]
+        force_true_aligned = force_target[:min_len]
+        damage_true = fatigue_damage(force_true_aligned)
+        damage_model = fatigue_damage(force_model_aligned)
+        damage_rel_err = relative_error(damage_model, damage_true)
+        if np.isfinite(damage_rel_err):
+            metrics["force_fatigue_damage_rel_error"] = damage_rel_err
+    else:
+        force_model_aligned = force_total_pred
+        force_true_aligned = force_target
+    half_idx_disp = len(y_true_norm) // 2
+    y_true_half = y_true_norm[half_idx_disp:]
+    y_model_half = rollout["y_norm"][half_idx_disp:]
+    half_idx_force = force_true_aligned.size // 2
+    force_true_half = force_true_aligned[half_idx_force:]
+    force_model_half = force_model_aligned[half_idx_force:]
+    if force_true_half.size > 0 and force_model_half.size > 0:
+        spectral_rel_err = spectral_relative_error(force_true_half, force_model_half, dt)
+        if np.isfinite(spectral_rel_err):
+            metrics["force_spectral_rel_error_second_half"] = spectral_rel_err
+    with torch.no_grad():
+        z_true = torch.stack(
+            (y_data_t, val_vel * m_eff), dim=1
+        )
+        force_on_data = model.u_theta(z_true).squeeze(-1).detach().cpu().numpy()
+    min_len_data = min(force_on_data.shape[0], force_target.shape[0])
+    if min_len_data > 0:
+        force_data_pred = force_on_data[:min_len_data]
+        force_data_true = force_target[:min_len_data]
+        rmse_force_data = float(np.sqrt(np.mean((force_data_pred - force_data_true) ** 2)))
+        force_range_data = float(np.ptp(force_data_true))
+        if force_range_data <= 0.0:
+            force_range_data = 1.0
+        metrics["rel_rmse_force_on_data"] = rmse_force_data / force_range_data
+        damage_true_data = fatigue_damage(force_data_true)
+        damage_pred_data = fatigue_damage(force_data_pred)
+        damage_rel_data = relative_error(damage_pred_data, damage_true_data)
+        if np.isfinite(damage_rel_data):
+            metrics["force_fatigue_damage_rel_error_on_data"] = damage_rel_data
+    for name, value in metrics.items():
+        writer.add_scalar(f"val/{name}", value, epoch)
+    zoom_mask = create_zoom_mask(t)
+    middle_mask = create_window_mask(t, middle_time_plot)
+    log_displacement_plots(
+        writer,
+        epoch,
+        t,
+        y_true_norm,
+        rollout["y_norm"],
+        rollout["p_norm"],
+        zoom_mask,
+        middle_mask,
+        middle_time_plot,
+    )
+    log_force_plots(
+        writer,
+        epoch,
+        t,
+        rollout["force_total"],
+        rollout["force_drag"],
+        rollout["force_model"],
+        force_data,
+        zoom_mask,
+        middle_mask,
+        middle_time_plot,
+        model.include_physical_drag,
+    )
+    log_hamiltonian_plots(
+        writer,
+        epoch,
+        t,
+        rollout["hamiltonian_model"],
+        zoom_mask,
+        middle_mask,
+        middle_time_plot,
+        hamiltonian_data=hamiltonian_data,
+    )
+    return metrics
+
+
+def compute_model_grad_norm(model: "PHVIV") -> float:
+    total = None
+    for p in model.parameters():
+        if p.grad is not None:
+            grad_sq = torch.sum(p.grad.detach() ** 2)
+            total = grad_sq if total is None else total + grad_sq
+    if total is None:
+        return 0.0
+    return float(torch.sqrt(total).detach().cpu())
 
 class Residual(nn.Module):
     def __init__(self, dim):
@@ -21,7 +286,7 @@ class Residual(nn.Module):
     def forward(self, x):
         out = F.gelu(self.fc1(x))
         out = self.fc2(out)
-        return F.gelu(out + x)  
+        return out + x  
 
 def dominant_frequency(signal: np.ndarray, dt: float) -> float:
     """Return dominant frequency (Hz) of the provided signal using FFT."""
@@ -135,6 +400,11 @@ class PHVIV(nn.Module):
         fourier_features: int = 64,
         fourier_sigma: float = 1.0,
         use_feature_engineering: bool = False,
+        force_net_type: str | None = None,
+        residual_hidden: int = 128,
+        residual_layers: int = 2,
+        mlp_hidden: int = 100,
+        mlp_layers: int = 2,
     ):
         super().__init__()
         self.dt = dt
@@ -157,17 +427,26 @@ class PHVIV(nn.Module):
         self.nn_p_scale = p_scale
         self.q_scale = 1.0
         self.p_scale = 1.0
-        self.residual_net = True
 
         # NN for instantaneous force u(x)
         pirate_force_kwargs = pirate_force_kwargs or {}
-        self.use_pirate_force = bool(use_pirate_force)
         self.use_fourier_features = bool(use_fourier_features)
         self.fourier_features = int(fourier_features)
         self.fourier_sigma = float(fourier_sigma)
         self.force_embed = None
         base_force_dim = self.force_input_dim
         force_in_features = base_force_dim
+        selected_net = force_net_type if force_net_type not in (None, "") else ("pirate" if use_pirate_force else "residual")
+        net_type = str(selected_net).lower()
+        valid_types = {"residual", "mlp", "pirate"}
+        if net_type not in valid_types:
+            raise ValueError(f"force_net_type must be one of {valid_types}, got '{force_net_type}'.")
+        self.use_pirate_force = net_type == "pirate"
+        self.residual_net = net_type == "residual"
+        self.residual_hidden = int(residual_hidden)
+        self.residual_layers = max(1, int(residual_layers))
+        self.mlp_hidden = int(mlp_hidden)
+        self.mlp_layers = max(1, int(mlp_layers))
         if self.use_fourier_features:
             if self.fourier_features < 1:
                 raise ValueError("fourier_features must be >= 1 when use_fourier_features is True")
@@ -184,31 +463,34 @@ class PHVIV(nn.Module):
             )
             force_in_features = 2 * self.fourier_features
 
+        pirate_cfg = dict(pirate_force_kwargs) if pirate_force_kwargs is not None else {}
         if self.use_pirate_force:
             pirate_args = {
                 "input_size": base_force_dim,
                 "output_size": 1,
-                "fourier_features": 64,
-                "sigma": 1.0,
-                "use_rwf": True
+                "depth": int(pirate_cfg.pop("depth", pirate_cfg.pop("pirate_layers", 2))),
+                "fourier_features": int(pirate_cfg.pop("fourier_features", 64)),
+                "sigma": float(pirate_cfg.pop("sigma", 1.0)),
+                "use_rwf": bool(pirate_cfg.pop("use_rwf", True)),
+                "activation": pirate_cfg.pop("activation", "tanh"),
             }
-            pirate_args.update(pirate_force_kwargs)
+            pirate_args.update(pirate_cfg)
             self.u_net = ODEPirateNet(**pirate_args)
         elif self.residual_net:
-            self.u_net = nn.Sequential(
-                nn.Linear(force_in_features, 128),
-                Residual(128),
-                Residual(128),
-                nn.Linear(128, 1),
-            ) 
+            layers = [nn.Linear(force_in_features, self.residual_hidden)]
+            for _ in range(self.residual_layers):
+                layers.append(Residual(self.residual_hidden))
+            layers.append(nn.Linear(self.residual_hidden, 1))
+            self.u_net = nn.Sequential(*layers)
         else:
-            self.u_net = nn.Sequential(
-                nn.Linear(force_in_features, 100),
-                nn.GELU(),
-                nn.Linear(100, 100),
-                nn.GELU(),
-                nn.Linear(100, 1),
-            )
+            mlp_layers: list[nn.Module] = []
+            in_features = force_in_features
+            for _ in range(self.mlp_layers):
+                mlp_layers.append(nn.Linear(in_features, self.mlp_hidden))
+                mlp_layers.append(nn.GELU())
+                in_features = self.mlp_hidden
+            mlp_layers.append(nn.Linear(self.mlp_hidden, 1))
+            self.u_net = nn.Sequential(*mlp_layers)
 
         if self.learn_hamiltonian:
             h_in_features = self.force_input_dim
@@ -243,6 +525,91 @@ class PHVIV(nn.Module):
                                                 [-1.0, 0.0]]))
         self.register_buffer("G", torch.tensor([[0.0],
                                                 [1.0]]))
+
+    @classmethod
+    def from_config(
+        cls,
+        dt: float,
+        cfg: dict[str, object],
+        arch_cfg: dict[str, object] | None = None,
+        device: torch.device | None = None,
+    ) -> tuple["PHVIV", dict[str, float]]:
+        rho = float(cfg.get("rho", 1000.0))
+        D = float(cfg.get("D", 0.1))
+        Ca = float(cfg.get("Ca", 1.0))
+        k = float(cfg.get("k", 1218.0))
+        U = float(cfg.get("U", 0.65))
+        damping_c = float(cfg.get("damping_c", 1e-4))
+        structural_mass = float(cfg.get("structural_mass", 16.79))
+        max_damping_ratio = float(cfg.get("max_damping_ratio", 0.2))
+        discover_damping = bool(cfg.get("discover_damping", False))
+        include_physical_drag = bool(cfg.get("include_physical_drag", False))
+        learn_hamiltonian = bool(cfg.get("learn_hamiltonian", False))
+        use_pirate_force = bool(cfg.get("use_pirate_force", False))
+        pirate_force_kwargs = cfg.get("pirate_force_kwargs", {}) or {}
+        use_fourier_features = bool(cfg.get("use_fourier_features", False))
+        fourier_features = int(cfg.get("fourier_features", 64))
+        fourier_sigma = float(cfg.get("fourier_sigma", 1.0))
+        use_feature_engineering = bool(cfg.get("use_feature_engineering", False))
+        arch_cfg = arch_cfg or {}
+        force_net_type = arch_cfg.get("force_net_type")
+        residual_hidden = arch_cfg.get("residual_hidden", 128)
+        residual_layers = arch_cfg.get("residual_layers", 2)
+        mlp_hidden = arch_cfg.get("mlp_hidden", 100)
+        mlp_layers = arch_cfg.get("mlp_layers", 2)
+        arch_activation = arch_cfg.get("activation")
+        pirate_arch_kwargs = arch_cfg.get("pirate_force_kwargs", {}) or {}
+        combined_pirate_kwargs = dict(pirate_force_kwargs)
+        combined_pirate_kwargs.update(pirate_arch_kwargs)
+        if arch_activation and "activation" not in combined_pirate_kwargs:
+            combined_pirate_kwargs["activation"] = arch_activation
+        if "rwf_mu" not in combined_pirate_kwargs:
+            combined_pirate_kwargs["rwf_mu"] = arch_cfg.get("pirate_rwf_mu", 1.0)
+        if "rwf_sigma" not in combined_pirate_kwargs:
+            combined_pirate_kwargs["rwf_sigma"] = arch_cfg.get("pirate_rwf_sigma", 0.1)
+        q_scale_val = cfg.get("q_scale")
+        q_scale = float(q_scale_val) if q_scale_val is not None else D
+        m_a = 0.25 * np.pi * D**2 * rho * Ca
+        m_eff = structural_mass + m_a
+        default_p_scale = np.sqrt(k / m_eff) * m_eff * D
+        p_scale_val = cfg.get("p_scale")
+        p_scale = float(p_scale_val) if p_scale_val is not None else default_p_scale
+        model = cls(
+            dt=dt,
+            m=m_eff,
+            k=k,
+            U=U,
+            rho=rho,
+            D=D,
+            q_scale=q_scale,
+            p_scale=p_scale,
+            max_damping_ratio=max_damping_ratio,
+            discover_damping=discover_damping,
+            damping_c=damping_c,
+            include_physical_drag=include_physical_drag,
+            learn_hamiltonian=learn_hamiltonian,
+            use_pirate_force=use_pirate_force,
+            pirate_force_kwargs=combined_pirate_kwargs,
+            use_fourier_features=use_fourier_features,
+            fourier_features=fourier_features,
+            fourier_sigma=fourier_sigma,
+            use_feature_engineering=use_feature_engineering,
+            force_net_type=force_net_type,
+            residual_hidden=residual_hidden,
+            residual_layers=residual_layers,
+            mlp_hidden=mlp_hidden,
+            mlp_layers=mlp_layers,
+        )
+        if device is not None:
+            model = model.to(device)
+        derived = {
+            "m_eff": m_eff,
+            "D": D,
+            "k": k,
+            "q_scale": q_scale,
+            "p_scale": p_scale,
+        }
+        return model, derived
 
     def H(self, x):
         if not self.learn_hamiltonian:
@@ -696,6 +1063,190 @@ def log_hamiltonian_plots(
     writer.add_figure("val/rollout_hamiltonian", fig, epoch + 1)
     plt.close(fig)
 
+def preprocess_timeseries(
+    t: np.ndarray,
+    y: np.ndarray,
+    force: np.ndarray,
+    hamiltonian: np.ndarray,
+    data_cfg: DataConfig,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
+    """
+    Apply optional steady-state trimming and uniform decimation to time-series arrays.
+    """
+    if t.size == 0:
+        return t, y, force, hamiltonian, float("nan")
+    mask = np.ones_like(t, dtype=bool)
+    if data_cfg.steadystate:
+        mask &= t > float(data_cfg.steadystate_time_threshold)
+    t_proc = t[mask]
+    y_proc = y[mask]
+    f_proc = force[mask]
+    h_proc = hamiltonian[mask]
+    step = max(1, int(data_cfg.reduction_factor if data_cfg.reduce_time else 1))
+    if step > 1:
+        t_proc = t_proc[::step]
+        y_proc = y_proc[::step]
+        f_proc = f_proc[::step]
+        h_proc = h_proc[::step]
+    dt_value = float(t_proc[1] - t_proc[0]) if t_proc.size > 1 else float("nan")
+    return t_proc, y_proc, f_proc, h_proc, dt_value
+
+
+def compute_velocity_numpy(
+    y_np: np.ndarray,
+    dt: float,
+    use_savgol: bool = True,
+    savgol_window: int = 15,
+    savgol_polyorder: int = 3,
+) -> np.ndarray:
+    signal = np.asarray(y_np, dtype=float)
+    if signal.size < 2 or dt <= 0.0:
+        return np.zeros_like(signal)
+    if use_savgol and savgol_filter is not None and signal.size >= 3:
+        window = min(int(savgol_window), signal.size)
+        if window % 2 == 0:
+            window -= 1
+        if window >= 3:
+            polyorder = min(int(savgol_polyorder), window - 1)
+            try:
+                vel = savgol_filter(
+                    signal,
+                    window_length=window,
+                    polyorder=polyorder,
+                    deriv=1,
+                    delta=dt,
+                    axis=0,
+                    mode="interp",
+                )
+                return np.ascontiguousarray(vel)
+            except ValueError:
+                pass
+    vel = np.zeros_like(signal)
+    vel[0] = (signal[1] - signal[0]) / dt if signal.size >= 2 else 0.0
+    vel[-1] = (signal[-1] - signal[-2]) / dt if signal.size >= 2 else 0.0
+    if signal.size > 2:
+        vel[1:-1] = (signal[2:] - signal[:-2]) / (2.0 * dt)
+    return vel
+
+
+def combine_datasets(datasets: list[TensorDataset | ConcatDataset]) -> TensorDataset | ConcatDataset:
+    if not datasets:
+        raise ValueError("No datasets provided for combination.")
+    return datasets[0] if len(datasets) == 1 else ConcatDataset(datasets)
+
+
+def build_dataloader_from_series(
+    series_data: list[tuple[np.ndarray, np.ndarray, float]],
+    m_eff: float,
+    batch_size: int,
+    device: torch.device,
+    smoothing_cfg: SmoothingConfig | None = None,
+    shuffle: bool = True,
+) -> tuple[DataLoader, list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]], int]:
+    if not series_data:
+        raise ValueError("series_data must contain at least one (y, t, dt) tuple.")
+    sequence_tensors: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+    datasets: list[TensorDataset | ConcatDataset] = []
+    min_length: int | None = None
+    for y_np, t_np, dt_value in series_data:
+        y_tensor, vel_tensor, t_tensor = prepare_sequence_tensors(
+            y_np,
+            t_np,
+            dt_value,
+            m_eff,
+            device,
+            smoothing_cfg=smoothing_cfg,
+        )
+        sequence_tensors.append((y_tensor, vel_tensor, t_tensor))
+        datasets.append(build_dataset(y_tensor, vel_tensor, m_eff, t_tensor))
+        seq_len = y_tensor.shape[0]
+        min_length = seq_len if min_length is None else min(min_length, seq_len)
+    dataset = combine_datasets(datasets)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
+    return loader, sequence_tensors, min_length if min_length is not None else 0
+
+
+def prepare_sequence_tensors(
+    y_np: np.ndarray,
+    t_np: np.ndarray,
+    dt: float,
+    m_eff: float,
+    device: torch.device,
+    smoothing_cfg: SmoothingConfig | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    y_arr = np.asarray(y_np, dtype=float)
+    t_arr = np.asarray(t_np, dtype=float)
+    if y_arr.shape[0] != t_arr.shape[0]:
+        raise ValueError("Displacement and time arrays must have the same length.")
+    if np.isfinite(dt):
+        dt_value = float(dt)
+    elif t_arr.size >= 2:
+        dt_value = float(t_arr[1] - t_arr[0])
+    else:
+        dt_value = 1.0
+    if smoothing_cfg is None:
+        smoothing_cfg = SmoothingConfig()
+    vel_np = compute_velocity_numpy(
+        y_arr,
+        dt_value,
+        use_savgol=smoothing_cfg.use_savgol_smoothing,
+        savgol_window=smoothing_cfg.window_length,
+        savgol_polyorder=smoothing_cfg.polyorder,
+    )
+    y_tensor = torch.from_numpy(y_arr).float().to(device)
+    vel_tensor = torch.from_numpy(vel_np).float().to(device)
+    t_tensor = torch.from_numpy(t_arr).float().to(device)
+    return y_tensor, vel_tensor, t_tensor
+
+
+def load_training_series(
+    y_eval: np.ndarray,
+    t_eval: np.ndarray,
+    dt_eval: float,
+    use_generated: bool,
+    series_dir: Path,
+    m_eff: float,
+    device: torch.device,
+    smoothing_cfg: SmoothingConfig | None = None,
+) -> tuple[list[tuple[np.ndarray, np.ndarray, float]], tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    train_series_raw: list[tuple[np.ndarray, np.ndarray, float]] = []
+    if use_generated:
+        if not series_dir.exists():
+            raise FileNotFoundError(f"Training series directory '{series_dir}' does not exist.")
+        series_files = sorted(series_dir.glob("*.npz"))
+        if not series_files:
+            raise FileNotFoundError(f"No '.npz' files found in training series directory '{series_dir}'.")
+        for series_file in series_files:
+            series_data = np.load(series_file)
+            series_t = np.asarray(series_data["a"])
+            series_y = np.asarray(series_data["b"])
+            if series_t.ndim != 1 or series_y.ndim != 1:
+                raise ValueError(f"Series '{series_file}' must contain 1D 'a' and 'b' arrays.")
+            if series_t.shape[0] != series_y.shape[0]:
+                raise ValueError(f"Series '{series_file}' has mismatched lengths.")
+            if series_t.shape[0] < 2:
+                raise ValueError(f"Series '{series_file}' is too short to build training samples.")
+            series_dt = float(series_t[1] - series_t[0])
+            if not np.allclose(np.diff(series_t), series_dt, rtol=1e-6, atol=1e-9):
+                raise ValueError(f"Series '{series_file}' time vector is not uniform.")
+            if not np.isclose(series_dt, dt_eval, rtol=1e-6, atol=1e-9):
+                series_y, series_t = resample_uniform_series(series_t, series_y, dt_eval)
+                series_dt = dt_eval
+            train_series_raw.append((series_y, series_t, series_dt))
+    else:
+        train_series_raw.append((y_eval, t_eval, dt_eval))
+
+    eval_tensors = prepare_sequence_tensors(
+        y_eval,
+        t_eval,
+        dt_eval,
+        m_eff,
+        device,
+        smoothing_cfg=smoothing_cfg,
+    )
+    return train_series_raw, eval_tensors
+
+
 def build_dataset(y_data_t: torch.Tensor, vel: torch.Tensor, m_eff: float, t_tensor: torch.Tensor) -> TensorDataset:
     """Construct consecutive state/time pairs for training."""
     z = torch.stack((y_data_t, vel * m_eff), dim=1)
@@ -758,6 +1309,38 @@ def create_window_mask(t: np.ndarray, time_window: tuple[float, float] | list[fl
     start, end = time_window
     mask = (t >= start) & (t <= end)
     return mask if np.count_nonzero(mask) > 1 else slice(None)
+
+
+def resample_uniform_series(
+    series_t: np.ndarray,
+    series_y: np.ndarray,
+    target_dt: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Resample a uniformly sampled series onto a new step using interpolation."""
+    if series_t.ndim != 1 or series_y.ndim != 1:
+        raise ValueError("Input series must be 1D arrays")
+    if series_t.size != series_y.size:
+        raise ValueError("Time and value arrays must have matching lengths")
+    if series_t.size < 2:
+        raise ValueError("Need at least two samples to resample a series")
+    t_start = float(series_t[0])
+    t_end = float(series_t[-1])
+    if target_dt <= 0.0:
+        raise ValueError("target_dt must be positive")
+    duration = t_end - t_start
+    if duration <= 0.0:
+        raise ValueError("Time vector must span a positive duration")
+    num_steps = int(np.floor(duration / target_dt))
+    if num_steps < 1:
+        raise ValueError("target_dt is larger than the available duration")
+    resampled_t = t_start + np.arange(num_steps + 1) * target_dt
+    # Ensure the resampled grid does not extend past the original support
+    while resampled_t[-1] - t_end > 1e-9:
+        resampled_t = resampled_t[:-1]
+        if resampled_t.size < 2:
+            raise ValueError("Resampled grid became too small")
+    resampled_y = np.interp(resampled_t, series_t, series_y)
+    return resampled_y, resampled_t
 
 def rollout_model(model: PHVIV, y0: torch.Tensor, vel: torch.Tensor, m_eff: float,
                   dt: float, t: np.ndarray, D: float, k: float, device: torch.device) -> dict[str, np.ndarray]:

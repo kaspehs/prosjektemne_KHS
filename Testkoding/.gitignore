@@ -1,2 +1,5 @@
 Testkoding/*.h5
 Testkoding/HNNruns
+Testkoding/HNNconfigs
+HNNconfigs/
+Data_Gen/generated_series/

@@ -350,7 +350,8 @@ class PirateNet(torch.nn.Module):
                  factorize_output: bool = False,
                  # Optional: make the first embedding branch sinusoidal
                  use_sine_embed: bool = False,
-                 w0_embed: float = 5.0):
+                 w0_embed: float = 5.0,
+                 activation: str = "tanh"):
         super().__init__()
         # Choose embedding: separate per-dim if x_features/t_features provided
         if x_features is not None and t_features is not None:
@@ -387,7 +388,16 @@ class PirateNet(torch.nn.Module):
             torch.nn.init.xavier_uniform_(self.w2.weight); torch.nn.init.zeros_(self.w2.bias)
 
         # Residual stack
-        self.act = torch.nn.Tanh()
+        act_lower = str(activation).lower()
+        if act_lower == "gelu":
+            act_cls = torch.nn.GELU
+        elif act_lower == "swish":
+            act_cls = torch.nn.SiLU
+        elif act_lower == "tanh":
+            act_cls = torch.nn.Tanh
+        else:
+            raise ValueError("activation must be 'gelu', 'swish', or 'tanh'")
+        self.act = act_cls()
         self.sine = Sine()
         self.blocks = torch.nn.ModuleList([
             ResidualBlock(embed_dim, self.act, use_rwf=use_rwf, rwf_mu=rwf_mu, rwf_sigma=rwf_sigma)
@@ -547,9 +557,9 @@ class ODEPirateNet(torch.nn.Module):
                  rwf_mu: float = 1.0,
                  rwf_sigma: float = 0.1,
                  factorize_output: bool = False,
-                 # Optional: make the first embedding branch sinusoidal
                  use_sine_embed: bool = False,
-                 w0_embed: float = 5.0):
+                 w0_embed: float = 5.0,
+                 activation: str = "tanh"):
         super().__init__()
 
         ff = fourier_features if fourier_features is not None else 128
@@ -576,8 +586,14 @@ class ODEPirateNet(torch.nn.Module):
                 torch.nn.init.xavier_uniform_(self.w1.weight); torch.nn.init.zeros_(self.w1.bias)
             torch.nn.init.xavier_uniform_(self.w2.weight); torch.nn.init.zeros_(self.w2.bias)
 
-        # Residual stack
-        self.act = torch.nn.Tanh()
+        act_lower = str(activation).lower()
+        if act_lower == "gelu":
+            act_cls = torch.nn.GELU
+        elif act_lower == "swish":
+            act_cls = torch.nn.SiLU
+        else:
+            act_cls = torch.nn.Tanh
+        self.act = act_cls()
         self.sine = Sine()
         self.blocks = torch.nn.ModuleList([
             ResidualBlock(embed_dim, self.act, use_rwf=use_rwf, rwf_mu=rwf_mu, rwf_sigma=rwf_sigma)

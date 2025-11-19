@@ -4,8 +4,9 @@ Generate multiple TD-model data series for different initial conditions.
 
 from __future__ import annotations
 
-import json
+import numpy as np
 import argparse
+import json
 from itertools import product
 from pathlib import Path
 from typing import Iterable
@@ -65,8 +66,8 @@ def main():
     )
     args = parser.parse_args()
 
-    amplitude_factors = [0.5, 1.0, 1.5]
-    fhat_values = [0.05, 0.10, 0.15, 0.20]
+    amplitude_factors = np.linspace(0.01, 1.5, 10)
+    fhat_values = np.linspace(0.01, 0.25, 10)
     run_batch(amplitude_factors, fhat_values, args.output_dir, integrator=args.integrator)
 
 

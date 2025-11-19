@@ -32,7 +32,7 @@ fhat0 = 0.144        # centre of synchronization
 fhat_min = 0.08
 fhat_max = 0.206
 
-T = 20.0
+T = 7.0
 dt = 0.0001
 
 def simulate_td_model_cf(
@@ -89,7 +89,7 @@ def simulate_td_model_cf(
     Fca = np.zeros(N)
 
     phi_vy = np.zeros(N)
-    phi_vy[0] = 2.0 * np.pi * rng.random()
+    #phi_vy[0] = 2.0 * np.pi * rng.random()
     sig_dy_loc = np.zeros(N)
     sig_ddy_loc = np.zeros(N)
 

@@ -1,4 +1,5 @@
 import torch
+import math
 import numpy as np
 from collections.abc import Iterable, Mapping
 from itertools import chain
@@ -495,7 +496,33 @@ class LrSchedule():
     def get_lr(self, step):
         if step <= self.warmup_steps:
             return self.max_lr * step/self.warmup_steps
-        return self.max_lr * (self.decay_rate)**((step-self.warmup_steps)/self.decay_steps) 
+        return self.max_lr * (self.decay_rate)**((step-self.warmup_steps)/self.decay_steps)
+    
+class WarmupCosineLrSchedule:
+    def __init__(self, max_lr, min_lr, warmup_steps, decay_steps):
+        """
+        max_lr: peak learning rate after warmup
+        min_lr: final learning rate at the end of cosine decay
+        warmup_steps: number of linear warmup steps
+        decay_steps: number of cosine decay steps
+        """
+        self.max_lr = max_lr
+        self.min_lr = min_lr
+        self.warmup_steps = warmup_steps
+        self.decay_steps = decay_steps
+
+    def get_lr(self, step):
+        # ----- Warmup -----
+        if step <= self.warmup_steps:
+            return self.max_lr * step / self.warmup_steps
+
+        # ----- Cosine decay -----
+        t = step - self.warmup_steps
+        if t >= self.decay_steps:
+            return self.min_lr
+
+        cosine_decay = 0.5 * (1 + math.cos(math.pi * t / self.decay_steps))
+        return self.min_lr + (self.max_lr - self.min_lr) * cosine_decay
 
 class ODETrainingStepper:
     def __init__(self, model, #The NN model

@@ -1,0 +1,66 @@
+data:
+  file: data.npz
+  steadystate: false
+  steadystate_time_threshold: 10.0
+  reduce_time: true
+  reduction_factor: 100
+  middle_time_plot: [15, 17]
+  use_generated_train_series: false
+  train_series_dir: Data_Gen/generated_series
+
+model:
+  rho: 1000.0
+  D: 0.1
+  structural_mass: 16.79
+  Ca: 1.0
+  k: 1218.0
+  U: 0.65
+  damping_c: 1e-4
+  max_damping_ratio: 0.2
+  include_physical_drag: false
+  learn_hamiltonian: false
+  discover_damping: false
+  use_pirate_force: false
+  pirate_force_kwargs: {}
+  use_fourier_features: false
+  fourier_features: 64
+  fourier_sigma: 1.0
+  use_feature_engineering: false
+
+smoothing:
+  use_savgol_smoothing: true
+  window_length: 15
+  polyorder: 4
+
+architecture:
+  force_net_type: residual
+  residual_hidden: 128
+  residual_layers: 2
+  mlp_hidden: 100
+  mlp_layers: 2
+  activation: tanh
+  pirate_force_kwargs:
+    fourier_features: 96
+    sigma: 0.5
+    use_rwf: true
+    activation: tanh
+
+training:
+  batch_size: 32
+  force_reg: 0.01
+  max_grad_norm: 10000.0
+  lr: 0.001
+  epochs: 2000
+  rollout_every_epoch: 50
+  use_lr_scheduler: false
+  scheduler:
+    max_lr: 0.001
+    decay_rate: 0.9
+    warmup_steps: 200
+    decay_steps: 200
+
+logging:
+  run_dir_root: HNNruns
+
+#For running all config files
+#ls HNNconfigs/*.yml | xargs -P 2 -I{} python3 HNN.py --config {}
