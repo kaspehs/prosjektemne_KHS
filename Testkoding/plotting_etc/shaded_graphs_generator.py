@@ -22,7 +22,7 @@ LABELS = [
     "No Smoothing",
     "No Scheduler",
     "No Force Reg.",
-    "RWF",
+    "No RWF",
 ]
 
 METRICS = [
@@ -48,11 +48,10 @@ MAX = [None,
        1e1,
        ]
 
-WINDOW = 20#*20        # smoothing window
-STD_WINDOW = 40#*20  # std window (often 2× smoothing window)
+WINDOW = 20*20        # smoothing window
+STD_WINDOW = 40*20  # std window (often 2× smoothing window)
 OUTPUT_DIR = "figs"
 DARK_MODE = False
-
 
 # ---------------------------
 # Utility functions

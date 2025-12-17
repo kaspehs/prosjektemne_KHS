@@ -38,12 +38,12 @@ fhat0 = 0.144        # centre of synchronization
 fhat_min = 0.08
 fhat_max = 0.206
 
-T = 10.0
+T = 20.0
 dt = 0.0001
 
 def simulate_td_model_cf(
-    A_factor: float = 0.0,
-    fhat: float = 0.0,
+    A_factor: float = 0.5,
+    fhat: float = 0.15,
     dt: float = dt,
     T: float = T,
     output_path: str | Path | None = "data_test.npz",

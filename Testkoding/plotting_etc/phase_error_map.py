@@ -4,10 +4,15 @@ from __future__ import annotations
 
 from dataclasses import asdict
 from pathlib import Path
+import sys
 
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+
+ROOT_DIR = Path(__file__).resolve().parents[1]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.append(str(ROOT_DIR))
 
 from HNN_helper import PHVIV, parse_config, compute_velocity_numpy, rollout_model
 from Data_Gen.simulate_td_model_cf import (
@@ -27,9 +32,10 @@ from Data_Gen.simulate_td_model_cf import (
 )
 from Data_Gen.utils import vforce_CF
 
-MODEL_PATH = Path("models/mlp_final1_1129-235240.pt")
-GRID_Q = np.linspace(-0.0, 0.0, 1)
-GRID_V = np.linspace(-0.0, 1.0, 7)
+
+MODEL_PATH = Path("models/residual_final1_1130-115801.pt")
+GRID_Q = np.linspace(-0.1, 0.1, 10)
+GRID_V = np.linspace(-1.0, 1.0, 10)
 SIM_FINE_DT = 1e-4
 SIM_T = 10.0
 DEVICE = torch.device("cpu")
@@ -173,10 +179,17 @@ def evaluate_initial_condition(model, derived, q0: float, v0: float, target_dt: 
     return disp_rmse / disp_range, force_rmse / force_range
 
 
-def plot_error_field(q_vals: np.ndarray, v_vals: np.ndarray, errors: np.ndarray, name: str):
+def plot_error_field(
+    q_vals: np.ndarray,
+    v_vals: np.ndarray,
+    errors: np.ndarray,
+    name: str,
+    vmin: float | None = None,
+    vmax: float | None = None,
+):
     fig, ax = plt.subplots(figsize=(6, 5))
     q_mesh, v_mesh = np.meshgrid(q_vals, v_vals, indexing="ij")
-    mesh = ax.pcolormesh(q_mesh, v_mesh, errors, shading="auto", cmap="viridis")
+    mesh = ax.pcolormesh(q_mesh, v_mesh, errors, shading="auto", cmap="viridis", vmin=vmin, vmax=vmax)
     ax.set_xlabel("Initial displacement q0")
     ax.set_ylabel("Initial velocity v0")
     ax.set_title(f"Initial-condition error ({name})")
@@ -199,8 +212,10 @@ def main():
             force_errors[i, j] = force_rmse
             print(f"q={q0:.3f}, v={v0:.3f} -> disp={disp_rmse:.3e}, force={force_rmse:.3e}")
 
-    plot_error_field(GRID_Q, GRID_V, disp_errors, "disp")
-    plot_error_field(GRID_Q, GRID_V, force_errors, "force")
+    disp_lims = (0.0, 0.5)
+    force_lims = (0.0, 0.2)
+    plot_error_field(GRID_Q, GRID_V, disp_errors, "disp", vmin=disp_lims[0], vmax=disp_lims[1])
+    plot_error_field(GRID_Q, GRID_V, force_errors, "force", vmin=force_lims[0], vmax=force_lims[1])
 
 
 if __name__ == "__main__":
