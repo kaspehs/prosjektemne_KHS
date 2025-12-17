@@ -10,10 +10,10 @@ import torch
 import torch.optim as optim
 import numpy as np
 from torch.utils.tensorboard import SummaryWriter
-from helper_functions import *
+from legacy_code.helper_functions import *
 from ODE_pinn_helper import *
 from architectures import BasicMLP, SirenMLP
-from ODE import build_ode_setup, print_ode_summary
+from legacy_code.ODE import build_ode_setup, print_ode_summary
 
 # Prefer Apple GPU (MPS) if available; use float32 for stability/speed
 #device = torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")

@@ -13,7 +13,7 @@ from torch.utils.tensorboard import SummaryWriter
 import yaml
 
 from HNN_helper import *
-from ODE_pinn_helper import LrSchedule, WarmupCosineLrSchedule
+from ODE_pinn_helper import LrSchedule, WarmupCosineLrSchedule, WarmupExponentialLrSchedule
 
 def main(config: Config, config_name: str):
     data_cfg = config.data
@@ -49,10 +49,11 @@ def main(config: Config, config_name: str):
     rollout_every_epoch = training_cfg.rollout_every_epoch
     use_lr_scheduler = training_cfg.use_lr_scheduler
     scheduler_cfg = training_cfg.scheduler
-    max_lr = scheduler_cfg.max_lr
-    decay_rate = scheduler_cfg.decay_rate
-    scheduler_warmup_steps = scheduler_cfg.warmup_steps
-    decay_steps = scheduler_cfg.decay_steps
+    max_lr = float(scheduler_cfg.max_lr)
+    decay_rate = float(scheduler_cfg.decay_rate)
+    scheduler_warmup_steps = int(scheduler_cfg.warmup_steps)
+    decay_steps = int(scheduler_cfg.decay_steps)
+    min_lr = float(getattr(scheduler_cfg, "min_lr", 0.02 * max_lr))
 
     device = torch.device("cpu")
 
@@ -91,15 +92,38 @@ def main(config: Config, config_name: str):
     logging_cfg = config.logging
     run_dir_root = logging_cfg.run_dir_root
     timestamp = time.strftime("%m%d-%H%M%S")
-    run_dir = os.path.join(run_dir_root, f"{config_name}_{timestamp}")
+    run_name = f"{config_name}_{timestamp}"
+    run_dir = os.path.join(run_dir_root, run_name)
     writer = SummaryWriter(log_dir=run_dir)
 
     y_true_norm = y_data / D
     force_data = F_data
 
-    opt = optim.Adam(model.parameters(), lr=lr)
-    #lr_scheduler = LrSchedule(max_lr, decay_rate, scheduler_warmup_steps, decay_steps)
-    lr_scheduler = WarmupCosineLrSchedule(max_lr, 0.02*max_lr, scheduler_warmup_steps, decay_steps)
+    optimizer_type = training_cfg.optimizer.lower()
+    weight_decay = float(training_cfg.weight_decay)
+    if optimizer_type == "adamw":
+        opt = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    elif optimizer_type == "adam":
+        opt = optim.Adam(model.parameters(), lr=lr)
+    else:
+        raise ValueError(f"Unsupported optimizer '{training_cfg.optimizer}'. Use 'adam' or 'adamw'.")
+    scheduler_type = scheduler_cfg.scheduler_type.lower() if hasattr(scheduler_cfg, "scheduler_type") else "cosine"
+    if scheduler_type == "cosine":
+        lr_scheduler = WarmupCosineLrSchedule(max_lr, min_lr, scheduler_warmup_steps, decay_steps)
+    elif scheduler_type == "exponential":
+        lr_scheduler = WarmupExponentialLrSchedule(max_lr, min_lr, scheduler_warmup_steps, epochs)
+    else:
+        raise ValueError(f"Unknown scheduler_type '{scheduler_type}'. Use 'cosine' or 'exponential'.")
+    gradnorm_balancer = None
+    if training_cfg.use_gradnorm:
+        gradnorm_balancer = GradNormBalancer(
+            model,
+            ["residual", "force"],
+            alpha=training_cfg.gradnorm_alpha,
+            eps=training_cfg.gradnorm_eps,
+            min_weight=training_cfg.gradnorm_min_weight,
+            max_weight=training_cfg.gradnorm_max_weight,
+        )
 
     for epoch in range(epochs):
 
@@ -116,6 +140,8 @@ def main(config: Config, config_name: str):
         avg_forces: list[float] = []
         res_grad_components: list[float] = []
         force_grad_components: list[float] = []
+        gradnorm_res_weights: list[float] = []
+        gradnorm_force_weights: list[float] = []
 
         for z_i, t_i, z_next, t_next in train_loader:
             z_i = z_i.to(device)
@@ -127,13 +153,28 @@ def main(config: Config, config_name: str):
 
             res_loss = model.res_loss(z_i, t_i, z_next, t_next)
             avg_force = model.avg_force(z_i, t_i, z_next, t_next)
-            force_loss = force_reg * avg_force
-            loss = res_loss + force_loss
+            base_force_loss = avg_force
+            #base_force_loss = avg_force * force_reg
+            if gradnorm_balancer is not None:
+                weights = gradnorm_balancer.update({"residual": res_loss, "force": base_force_loss})
+                res_weight = weights["residual"]
+                force_weight = weights["force"]
+                gradnorm_res_weights.append(float(res_weight.detach().cpu()))
+                gradnorm_force_weights.append(float(force_weight.detach().cpu()))
+            else:
+                res_weight = res_loss.new_tensor(1.0)
+                force_weight = res_loss.new_tensor(1.0)
 
-            res_loss.backward(retain_graph=True)
+            weighted_res = res_weight * res_loss
+            force_loss = force_reg * base_force_loss
+            #force_loss = base_force_loss
+            weighted_force = force_weight * force_loss
+            loss = weighted_res + weighted_force
+
+            weighted_res.backward(retain_graph=True)
             res_grad_components.append(compute_model_grad_norm(model))
             model.zero_grad(set_to_none=True)
-            force_loss.backward(retain_graph=True)
+            weighted_force.backward(retain_graph=True)
             force_grad_components.append(compute_model_grad_norm(model))
             model.zero_grad(set_to_none=True)
             loss.backward()
@@ -175,6 +216,10 @@ def main(config: Config, config_name: str):
             "grad_norm_residual_comp": mean_res_grad_component,
             "grad_norm_force_comp": mean_force_grad_component,
         }
+        if gradnorm_res_weights:
+            train_metrics["gradnorm_weight_residual"] = float(np.mean(gradnorm_res_weights))
+        if gradnorm_force_weights:
+            train_metrics["gradnorm_weight_force"] = float(np.mean(gradnorm_force_weights))
         log_training_metrics(writer, epoch, train_metrics)
         print(
             f"Epoch {epoch}: loss={mean_loss:.4e}, res={mean_res_loss:.4e}, "
@@ -200,6 +245,19 @@ def main(config: Config, config_name: str):
                 middle_time_plot,
                 hamiltonian_data,
             )
+
+    models_dir = Path("models")
+    models_dir.mkdir(parents=True, exist_ok=True)
+    model_path = models_dir / f"{run_name}.pt"
+    torch.save(
+        {
+            "model_state": model.state_dict(),
+            "config": asdict(config),
+            "run_name": run_name,
+        },
+        model_path,
+    )
+    print(f"Saved final model to {model_path}")
 
     writer.flush()
     writer.close()

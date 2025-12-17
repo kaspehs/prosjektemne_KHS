@@ -66,8 +66,8 @@ def main():
     )
     args = parser.parse_args()
 
-    amplitude_factors = np.linspace(0.01, 1.5, 10)
-    fhat_values = np.linspace(0.01, 0.25, 10)
+    amplitude_factors = [0.1, 0.3, 0.7, 0.9]
+    fhat_values = [0.05, 0.10, 0.20, 0.25]
     run_batch(amplitude_factors, fhat_values, args.output_dir, integrator=args.integrator)
 
 

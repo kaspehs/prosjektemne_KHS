@@ -17,7 +17,7 @@ import pathlib
 import matplotlib.pyplot as plt
 
 # ---- Import your config helpers (must be in same folder) ----
-from ODE import ODEConfig, build_ode_setup, print_ode_summary
+from legacy_code.ODE import ODEConfig, build_ode_setup, print_ode_summary
 
 # =========================
 # ======= CONFIG ==========

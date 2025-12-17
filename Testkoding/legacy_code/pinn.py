@@ -11,7 +11,7 @@ import torch.nn as nn
 import torch.optim as optim
 import numpy as np
 from torch.utils.tensorboard import SummaryWriter
-from helper_functions import *
+from legacy_code.helper_functions import *
 from pinn_helper import *
 from architectures import *
 

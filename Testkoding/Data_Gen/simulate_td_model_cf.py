@@ -9,8 +9,14 @@ from typing import Dict
 
 import matplotlib.pyplot as plt
 import numpy as np
-
-from utils import vforce_CF
+try:
+    from utils import vforce_CF
+except:
+    pass
+try:
+    from Data_Gen.utils import vforce_CF
+except:
+    pass
 
 # Base physical parameters
 M = 16.79            # mass kg
@@ -32,15 +38,15 @@ fhat0 = 0.144        # centre of synchronization
 fhat_min = 0.08
 fhat_max = 0.206
 
-T = 7.0
+T = 10.0
 dt = 0.0001
 
 def simulate_td_model_cf(
-    A_factor: float = 1.0,
-    fhat: float = 0.1,
+    A_factor: float = 0.0,
+    fhat: float = 0.0,
     dt: float = dt,
     T: float = T,
-    output_path: str | Path | None = "data.npz",
+    output_path: str | Path | None = "data_test.npz",
     plot: bool = False,
     seed: int | None = None,
     verbose: bool = False,
@@ -62,11 +68,12 @@ def simulate_td_model_cf(
 
     Returns:
         Dictionary with time, displacement, force, Hamiltonian, velocity, etc.
-    """
+    
     if A_factor <= 0.0:
         raise ValueError("A_factor must be positive.")
     if fhat <= 0.0:
         raise ValueError("fhat must be positive.")
+        """
     if dt <= 0.0:
         raise ValueError("dt must be positive.")
     if T <= 0.0:
@@ -173,13 +180,13 @@ def simulate_td_model_cf(
         ddy[i + 1] = acceleration(y_next, dy_next, Fy[i + 1])
 
     # truncate the last element to keep shapes consistent with original script
-    time = time[:-1]
-    y = y[:-1]
-    dy = dy[:-1]
-    Fy = Fy[:-1]
-    Fcv = Fcv[:-1]
-    Fdy = Fdy[:-1]
-    Fca = Fca[:-1]
+    time = time[1:-1]
+    y = y[1:-1]
+    dy = dy[1:-1]
+    Fy = Fy[1:-1]
+    Fcv = Fcv[1:-1]
+    Fdy = Fdy[1:-1]
+    Fca = Fca[1:-1]
 
     H = 0.5 * K * y**2 + 0.5 * (M + D**2 / 4.0 * rho * np.pi * Ca) * dy**2
     F_total = Fcv + Fdy

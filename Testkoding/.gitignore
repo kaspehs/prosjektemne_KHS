@@ -3,3 +3,7 @@ Testkoding/HNNruns
 Testkoding/HNNconfigs
 HNNconfigs/
 Data_Gen/generated_series/
+*.npz
+*.yml
+*.pt
+*.png

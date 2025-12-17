@@ -2,13 +2,12 @@ import math
 import yaml
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import ConcatDataset, DataLoader, TensorDataset
 from torch.utils.tensorboard import SummaryWriter
 
@@ -54,16 +53,19 @@ class ModelConfig:
     q_scale: float | None = None
     p_scale: float | None = None
 
+def _default_residual_kwargs() -> dict[str, Any]:
+    return {"hidden": 128, "layers": 2, "activation": "gelu"}
+
+
+def _default_mlp_kwargs() -> dict[str, Any]:
+    return {"hidden": 100, "layers": 2, "activation": "gelu"}
+
+
 @dataclass
 class ArchitectureConfig:
     force_net_type: str = "residual"
-    residual_hidden: int = 128
-    residual_layers: int = 2
-    mlp_hidden: int = 100
-    mlp_layers: int = 2
-    activation: str = "tanh"
-    pirate_rwf_mu: float = 1.0
-    pirate_rwf_sigma: float = 0.1
+    residual_kwargs: dict[str, Any] = field(default_factory=_default_residual_kwargs)
+    mlp_kwargs: dict[str, Any] = field(default_factory=_default_mlp_kwargs)
     pirate_force_kwargs: dict[str, Any] = field(default_factory=dict)
 
 @dataclass
@@ -78,6 +80,8 @@ class SchedulerConfig:
     decay_rate: float = 0.9
     warmup_steps: int = 1000
     decay_steps: int = 1000
+    min_lr: float = 1e-5
+    scheduler_type: str = "cosine"  # or "exponential"
 
 @dataclass
 class TrainingConfig:
@@ -85,10 +89,17 @@ class TrainingConfig:
     force_reg: float = 1e-2
     max_grad_norm: float = 1e4
     lr: float = 1e-3
+    optimizer: str = "adam"
+    weight_decay: float = 0.0
     epochs: int = 2000
     rollout_every_epoch: int = 50
     use_lr_scheduler: bool = False
     scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
+    use_gradnorm: bool = False
+    gradnorm_alpha: float = 0.9
+    gradnorm_eps: float = 1e-8
+    gradnorm_min_weight: float = 0.1
+    gradnorm_max_weight: float = 10.0
 
 @dataclass
 class LoggingConfig:
@@ -114,10 +125,51 @@ def load_config(config_path: str | Path) -> dict[str, Any]:
 def parse_config(raw: dict[str, Any]) -> Config:
     data_cfg = raw.get("data", {}) or {}
     model_cfg = raw.get("model", {}) or {}
-    architecture_cfg = raw.get("architecture", {}) or {}
+    architecture_cfg = dict(raw.get("architecture", {}) or {})
     smoothing_cfg = raw.get("smoothing", {}) or {}
     training_cfg = raw.get("training", {}) or {}
     logging_cfg = raw.get("logging", {}) or {}
+
+    legacy_residual: dict[str, Any] = {}
+    if "residual_hidden" in architecture_cfg:
+        legacy_residual["hidden"] = architecture_cfg.pop("residual_hidden")
+    if "residual_layers" in architecture_cfg:
+        legacy_residual["layers"] = architecture_cfg.pop("residual_layers")
+    if "residual_activation" in architecture_cfg:
+        legacy_residual["activation"] = architecture_cfg.pop("residual_activation")
+    if legacy_residual or "residual_kwargs" in architecture_cfg:
+        residual_kwargs = dict(architecture_cfg.get("residual_kwargs", {}) or {})
+        residual_kwargs.update(legacy_residual)
+        architecture_cfg["residual_kwargs"] = residual_kwargs
+
+    legacy_mlp: dict[str, Any] = {}
+    if "mlp_hidden" in architecture_cfg:
+        legacy_mlp["hidden"] = architecture_cfg.pop("mlp_hidden")
+    if "mlp_layers" in architecture_cfg:
+        legacy_mlp["layers"] = architecture_cfg.pop("mlp_layers")
+    if "mlp_activation" in architecture_cfg:
+        legacy_mlp["activation"] = architecture_cfg.pop("mlp_activation")
+    if legacy_mlp or "mlp_kwargs" in architecture_cfg:
+        mlp_kwargs = dict(architecture_cfg.get("mlp_kwargs", {}) or {})
+        mlp_kwargs.update(legacy_mlp)
+        architecture_cfg["mlp_kwargs"] = mlp_kwargs
+
+    pirate_overrides: dict[str, Any] = {}
+    if "pirate_activation" in architecture_cfg:
+        pirate_overrides["activation"] = architecture_cfg.pop("pirate_activation")
+    if "activation" in architecture_cfg:
+        pirate_overrides["activation"] = architecture_cfg.pop("activation")
+    if "pirate_rwf_mu" in architecture_cfg:
+        pirate_overrides["rwf_mu"] = architecture_cfg.pop("pirate_rwf_mu")
+    if "pirate_rwf_sigma" in architecture_cfg:
+        pirate_overrides["rwf_sigma"] = architecture_cfg.pop("pirate_rwf_sigma")
+    if "pirate_depth" in architecture_cfg:
+        pirate_overrides["depth"] = architecture_cfg.pop("pirate_depth")
+    if "pirate_layers" in architecture_cfg:
+        pirate_overrides["depth"] = architecture_cfg.pop("pirate_layers")
+    pirate_kwargs = dict(architecture_cfg.get("pirate_force_kwargs", {}) or {})
+    pirate_kwargs.update(pirate_overrides)
+    architecture_cfg["pirate_force_kwargs"] = pirate_kwargs
 
     data = DataConfig(**data_cfg)
     model = ModelConfig(**model_cfg)
@@ -277,14 +329,109 @@ def compute_model_grad_norm(model: "PHVIV") -> float:
         return 0.0
     return float(torch.sqrt(total).detach().cpu())
 
+
+class GradNormBalancer:
+    """Balance multiple loss terms by equalizing their gradient norms."""
+
+    def __init__(
+        self,
+        model: nn.Module,
+        names: Sequence[str],
+        alpha: float = 0.9,
+        eps: float = 1e-8,
+        min_weight: float = 0.1,
+        max_weight: float = 10.0,
+    ) -> None:
+        if not names:
+            raise ValueError("GradNormBalancer requires at least one loss name")
+        self.model = model
+        self.names = tuple(names)
+        self.alpha = float(alpha)
+        self.eps = float(eps)
+        self.min_weight = float(min_weight)
+        self.max_weight = float(max_weight)
+        params = [p for p in model.parameters() if p.requires_grad]
+        if not params:
+            raise ValueError("Model must have trainable parameters for GradNormBalancer")
+        self.params = params
+        self.device = params[0].device
+        self.g_ema = {name: torch.tensor(1.0, device=self.device) for name in self.names}
+        self.weights = {name: torch.tensor(1.0, device=self.device) for name in self.names}
+        self.latest_grad_norms = {name: torch.tensor(0.0, device=self.device) for name in self.names}
+
+    def _grad_norm(self, loss: torch.Tensor) -> torch.Tensor:
+        grads = torch.autograd.grad(
+            loss,
+            self.params,
+            retain_graph=True,
+            create_graph=False,
+            allow_unused=True,
+        )
+        total = None
+        for g in grads:
+            if g is None:
+                continue
+            g = g.detach()
+            if not torch.isfinite(g).all():
+                g = torch.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0)
+            val = torch.sum(g * g)
+            total = val if total is None else total + val
+        if total is None:
+            return torch.tensor(0.0, device=self.device)
+        return torch.sqrt(total + self.eps)
+
+    def update(self, losses: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        missing = [name for name in self.names if name not in losses]
+        if missing:
+            raise KeyError(f"GradNormBalancer missing losses for: {missing}")
+        grad_norms = {name: self._grad_norm(losses[name]) for name in self.names}
+        with torch.no_grad():
+            for name in self.names:
+                self.latest_grad_norms[name] = grad_norms[name].detach()
+                self.g_ema[name] = self.alpha * self.g_ema[name] + (1.0 - self.alpha) * torch.clamp(
+                    grad_norms[name], min=self.eps
+                )
+            inv = {name: 1.0 / torch.clamp(self.g_ema[name], min=self.eps) for name in self.names}
+            total_inv = sum(inv.values())
+            count = float(len(self.names))
+            for name in self.names:
+                weight = inv[name] * (count / total_inv)
+                self.weights[name] = torch.clamp(weight, self.min_weight, self.max_weight)
+            return {name: self.weights[name].detach() for name in self.names}
+
+def _activation_factory(name: str | None, default: str = "gelu") -> type[nn.Module]:
+    mapping: dict[str, type[nn.Module]] = {
+        "gelu": nn.GELU,
+        "relu": nn.ReLU,
+        "leaky_relu": nn.LeakyReLU,
+        "elu": nn.ELU,
+        "silu": nn.SiLU,
+        "swish": nn.SiLU,
+        "tanh": nn.Tanh,
+        "sigmoid": nn.Sigmoid,
+        "identity": nn.Identity,
+        "none": nn.Identity,
+    }
+    key = str(name).lower() if name is not None else default
+    key = "silu" if key == "swish" else key
+    if key not in mapping:
+        raise ValueError(
+            f"Unsupported activation '{name}'. "
+            f"Available options: {', '.join(sorted(set(mapping.keys())))}"
+        )
+    return mapping[key]
+
+
 class Residual(nn.Module):
-    def __init__(self, dim):
+    def __init__(self, dim: int, activation: str | None = None):
         super().__init__()
         self.fc1 = nn.Linear(dim, dim)
         self.fc2 = nn.Linear(dim, dim)
+        act_cls = _activation_factory(activation)
+        self.activation = act_cls()
 
     def forward(self, x):
-        out = F.gelu(self.fc1(x))
+        out = self.activation(self.fc1(x))
         out = self.fc2(out)
         return out + x  
 
@@ -312,13 +459,13 @@ def dominant_frequency(signal: np.ndarray, dt: float) -> float:
 
 
 def relative_error(model_value: float, true_value: float, eps: float = 1e-12) -> float:
-    """Compute |model - true| / |true| with small epsilon safeguard."""
+    """Compute signed (model - true)/|true| with small epsilon safeguard."""
     if not np.isfinite(true_value) or not np.isfinite(model_value):
         return float("nan")
     denom = abs(true_value)
     if denom <= eps:
         return float("nan")
-    return float(abs(model_value - true_value) / (denom + eps))
+    return float((model_value - true_value) / (denom + eps))
 
 
 def spectral_relative_error(
@@ -401,10 +548,8 @@ class PHVIV(nn.Module):
         fourier_sigma: float = 1.0,
         use_feature_engineering: bool = False,
         force_net_type: str | None = None,
-        residual_hidden: int = 128,
-        residual_layers: int = 2,
-        mlp_hidden: int = 100,
-        mlp_layers: int = 2,
+        residual_kwargs: dict[str, Any] | None = None,
+        mlp_kwargs: dict[str, Any] | None = None,
     ):
         super().__init__()
         self.dt = dt
@@ -422,6 +567,19 @@ class PHVIV(nn.Module):
         self.use_feature_engineering = bool(use_feature_engineering)
         self.engineered_feature_dim = 7
         self.force_input_dim = self.engineered_feature_dim if self.use_feature_engineering else 2
+
+        residual_cfg = _default_residual_kwargs()
+        if residual_kwargs:
+            residual_cfg.update(residual_kwargs)
+        mlp_cfg = _default_mlp_kwargs()
+        if mlp_kwargs:
+            mlp_cfg.update(mlp_kwargs)
+        self.residual_hidden = int(residual_cfg.get("hidden", 128))
+        self.residual_layers = max(1, int(residual_cfg.get("layers", 2)))
+        self.residual_activation = residual_cfg.get("activation", "gelu")
+        self.mlp_hidden = int(mlp_cfg.get("hidden", 100))
+        self.mlp_layers = max(1, int(mlp_cfg.get("layers", 2)))
+        self.mlp_activation = mlp_cfg.get("activation", "gelu")
 
         self.nn_q_scale = q_scale
         self.nn_p_scale = p_scale
@@ -443,10 +601,6 @@ class PHVIV(nn.Module):
             raise ValueError(f"force_net_type must be one of {valid_types}, got '{force_net_type}'.")
         self.use_pirate_force = net_type == "pirate"
         self.residual_net = net_type == "residual"
-        self.residual_hidden = int(residual_hidden)
-        self.residual_layers = max(1, int(residual_layers))
-        self.mlp_hidden = int(mlp_hidden)
-        self.mlp_layers = max(1, int(mlp_layers))
         if self.use_fourier_features:
             if self.fourier_features < 1:
                 raise ValueError("fourier_features must be >= 1 when use_fourier_features is True")
@@ -479,15 +633,16 @@ class PHVIV(nn.Module):
         elif self.residual_net:
             layers = [nn.Linear(force_in_features, self.residual_hidden)]
             for _ in range(self.residual_layers):
-                layers.append(Residual(self.residual_hidden))
+                layers.append(Residual(self.residual_hidden, activation=self.residual_activation))
             layers.append(nn.Linear(self.residual_hidden, 1))
             self.u_net = nn.Sequential(*layers)
         else:
             mlp_layers: list[nn.Module] = []
             in_features = force_in_features
+            mlp_act_cls = _activation_factory(self.mlp_activation)
             for _ in range(self.mlp_layers):
                 mlp_layers.append(nn.Linear(in_features, self.mlp_hidden))
-                mlp_layers.append(nn.GELU())
+                mlp_layers.append(mlp_act_cls())
                 in_features = self.mlp_hidden
             mlp_layers.append(nn.Linear(self.mlp_hidden, 1))
             self.u_net = nn.Sequential(*mlp_layers)
@@ -553,20 +708,19 @@ class PHVIV(nn.Module):
         use_feature_engineering = bool(cfg.get("use_feature_engineering", False))
         arch_cfg = arch_cfg or {}
         force_net_type = arch_cfg.get("force_net_type")
-        residual_hidden = arch_cfg.get("residual_hidden", 128)
-        residual_layers = arch_cfg.get("residual_layers", 2)
-        mlp_hidden = arch_cfg.get("mlp_hidden", 100)
-        mlp_layers = arch_cfg.get("mlp_layers", 2)
-        arch_activation = arch_cfg.get("activation")
+        residual_kwargs = _default_residual_kwargs()
+        residual_kwargs.update(arch_cfg.get("residual_kwargs", {}) or {})
+        mlp_kwargs = _default_mlp_kwargs()
+        mlp_kwargs.update(arch_cfg.get("mlp_kwargs", {}) or {})
         pirate_arch_kwargs = arch_cfg.get("pirate_force_kwargs", {}) or {}
         combined_pirate_kwargs = dict(pirate_force_kwargs)
         combined_pirate_kwargs.update(pirate_arch_kwargs)
-        if arch_activation and "activation" not in combined_pirate_kwargs:
-            combined_pirate_kwargs["activation"] = arch_activation
+        if "activation" not in combined_pirate_kwargs:
+            combined_pirate_kwargs["activation"] = "tanh"
         if "rwf_mu" not in combined_pirate_kwargs:
-            combined_pirate_kwargs["rwf_mu"] = arch_cfg.get("pirate_rwf_mu", 1.0)
+            combined_pirate_kwargs["rwf_mu"] = 1.0
         if "rwf_sigma" not in combined_pirate_kwargs:
-            combined_pirate_kwargs["rwf_sigma"] = arch_cfg.get("pirate_rwf_sigma", 0.1)
+            combined_pirate_kwargs["rwf_sigma"] = 0.1
         q_scale_val = cfg.get("q_scale")
         q_scale = float(q_scale_val) if q_scale_val is not None else D
         m_a = 0.25 * np.pi * D**2 * rho * Ca
@@ -595,10 +749,8 @@ class PHVIV(nn.Module):
             fourier_sigma=fourier_sigma,
             use_feature_engineering=use_feature_engineering,
             force_net_type=force_net_type,
-            residual_hidden=residual_hidden,
-            residual_layers=residual_layers,
-            mlp_hidden=mlp_hidden,
-            mlp_layers=mlp_layers,
+            residual_kwargs=residual_kwargs,
+            mlp_kwargs=mlp_kwargs,
         )
         if device is not None:
             model = model.to(device)

@@ -1,7 +1,7 @@
 import torch
 import numpy as np
 from torch import nn, autograd
-from helper_functions import figure_compare_data
+from legacy_code.helper_functions import figure_compare_data
 
 def d(outputs, inputs, retain_graph=True, create_graph=True):
     """First derivative helper that is safe for higher-order calls.

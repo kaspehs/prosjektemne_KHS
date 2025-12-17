@@ -5,7 +5,7 @@ from collections.abc import Iterable, Mapping
 from itertools import chain
 from torch import nn, autograd
 import torch.nn.functional as F
-from helper_functions import figure_compare_data
+from legacy_code.helper_functions import figure_compare_data
 
 
 class TrainableODEParams(nn.Module):
@@ -523,6 +523,28 @@ class WarmupCosineLrSchedule:
 
         cosine_decay = 0.5 * (1 + math.cos(math.pi * t / self.decay_steps))
         return self.min_lr + (self.max_lr - self.min_lr) * cosine_decay
+
+
+class WarmupExponentialLrSchedule:
+    def __init__(self, max_lr, min_lr, warmup_steps, total_steps):
+        if min_lr <= 0 or max_lr <= 0:
+            raise ValueError("Learning rates must be positive for exponential schedule")
+        if total_steps <= 0:
+            raise ValueError("total_steps must be positive for exponential schedule")
+        self.max_lr = float(max_lr)
+        self.min_lr = float(min_lr)
+        self.warmup_steps = int(max(warmup_steps, 0))
+        self.total_steps = int(max(total_steps, self.warmup_steps + 1))
+        self.decay_steps = max(self.total_steps - self.warmup_steps, 1)
+        ratio = self.min_lr / self.max_lr
+        self.decay_base = ratio ** (1.0 / self.decay_steps)
+
+    def get_lr(self, step):
+        if self.warmup_steps > 0 and step <= self.warmup_steps:
+            return self.max_lr * step / self.warmup_steps
+        t = min(max(step - self.warmup_steps, 0), self.decay_steps)
+        lr = self.max_lr * (self.decay_base ** t)
+        return max(min(lr, self.max_lr), self.min_lr)
 
 class ODETrainingStepper:
     def __init__(self, model, #The NN model

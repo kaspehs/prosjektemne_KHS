@@ -34,11 +34,14 @@ smoothing:
 
 architecture:
   force_net_type: residual
-  residual_hidden: 128
-  residual_layers: 2
-  mlp_hidden: 100
-  mlp_layers: 2
-  activation: tanh
+  residual_kwargs:
+    hidden: 128
+    layers: 2
+    activation: gelu
+  mlp_kwargs:
+    hidden: 100
+    layers: 2
+    activation: gelu
   pirate_force_kwargs:
     fourier_features: 96
     sigma: 0.5
@@ -50,17 +53,25 @@ training:
   force_reg: 0.01
   max_grad_norm: 10000.0
   lr: 0.001
+  optimizer: adam
+  weight_decay: 1e-5
   epochs: 2000
   rollout_every_epoch: 50
-  use_lr_scheduler: false
+  use_lr_scheduler: true
   scheduler:
     max_lr: 0.001
-    decay_rate: 0.9
+    decay_rate: 0.99
     warmup_steps: 200
     decay_steps: 200
+    min_lr: 0.0001
+    scheduler_type: exponential
+  use_gradnorm: true
+  gradnorm_alpha: 0.9
+  gradnorm_min_weight: 0.2
+  gradnorm_max_weight: 5.0
 
 logging:
   run_dir_root: HNNruns
 
 #For running all config files
-#ls HNNconfigs/*.yml | xargs -P 2 -I{} python3 HNN.py --config {}
+#ls HNNrunconfigs/*.yml | xargs -P 2 -I{} python3 HNN.py --config {}
